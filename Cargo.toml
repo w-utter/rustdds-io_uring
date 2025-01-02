@@ -14,7 +14,7 @@ keywords = ["network","protocol","dds","rtps"]
 license = "Apache-2.0"
 edition = "2021"
 homepage = "https://atostek.com/en/products/rustdds/"  
-repository = "https://github.com/jhelovuo/RustDDS"
+repository = "https://github.com/Atostek/RustDDS"
 categories = ["network-programming", "science::robotics"] 
 rust-version = "1.70.0"
 # the science-robotics category is because of ROS2
