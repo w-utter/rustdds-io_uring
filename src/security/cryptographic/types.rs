@@ -94,7 +94,6 @@ impl fmt::Display for CryptoTransformKeyId {
 /// may return the unencoded input or an encoded message between a
 /// `SecurePrefix` and `SecurePostfix`. See 7.3.6.4.4 and 8.5.1.9.2 in DDS
 /// Security v1.1.
-
 pub enum EncodedSubmessage {
   Unencoded(Submessage),
   Encoded(Submessage, Submessage, Submessage),

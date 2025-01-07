@@ -296,7 +296,7 @@ impl Discovery {
         match $constructor {
           Ok(r) => r,
           Err(e) => {
-            error!($msg, e);
+            error!("{} {:?}", $msg, e);
             discovery_started_sender
               .send(Err(CreateError::OutOfResources {
                 reason: $msg.to_string(),
@@ -310,10 +310,7 @@ impl Discovery {
       };
     }
 
-    let poll = try_construct!(
-      mio_06::Poll::new(),
-      "Failed to allocate discovery poll. {:?}"
-    );
+    let poll = try_construct!(mio_06::Poll::new(), "Failed to allocate discovery poll.");
     let discovery_subscriber_qos = Self::subscriber_qos();
     let discovery_publisher_qos = Self::publisher_qos();
 
@@ -321,11 +318,11 @@ impl Discovery {
     // These are needed to create DataWriter and DataReader objects
     let discovery_subscriber = try_construct!(
       domain_participant.create_subscriber(&discovery_subscriber_qos),
-      "Unable to create Discovery Subscriber. {:?}"
+      "Unable to create Discovery Subscriber."
     );
     let discovery_publisher = try_construct!(
       domain_participant.create_publisher(&discovery_publisher_qos),
-      "Unable to create Discovery Publisher. {:?}"
+      "Unable to create Discovery Publisher."
     );
 
     macro_rules! construct_topic_and_poll {
@@ -393,7 +390,7 @@ impl Discovery {
         Ready::readable(),
         PollOpt::edge(),
       ),
-      "Failed to register Discovery poll. {:?}"
+      "Failed to register Discovery poll."
     );
 
     try_construct!(
@@ -403,7 +400,7 @@ impl Discovery {
         Ready::readable(),
         PollOpt::edge(),
       ),
-      "Failed to register Discovery poll. {:?}"
+      "Failed to register Discovery poll."
     );
 
     // Participant
@@ -434,7 +431,7 @@ impl Discovery {
         Ready::readable(),
         PollOpt::edge(),
       ),
-      "Unable to create participant cleanup timer. {:?}"
+      "Unable to create participant cleanup timer."
     );
 
     // Subscriptions: What are the Readers on the network and what are they
@@ -493,7 +490,7 @@ impl Discovery {
         Ready::readable(),
         PollOpt::edge(),
       ),
-      "Unable to register topic cleanup timer. {:?}"
+      "Unable to register topic cleanup timer."
     );
 
     // Participant Message Data 8.4.13
@@ -628,7 +625,7 @@ impl Discovery {
           Ready::readable(),
           PollOpt::edge(),
         ),
-        "Unable to create secure message resend timer. {:?}"
+        "Unable to create secure message resend timer."
       );
       secure_message_resend_timer
     };
@@ -641,7 +638,7 @@ impl Discovery {
       // Plugins is Some so security is enabled. Initialize SecureDiscovery
       let security = try_construct!(
         SecureDiscovery::new(&domain_participant, &discovery_db, plugins_handle),
-        "Could not initialize Secure Discovery. {:?}"
+        "Could not initialize Secure Discovery."
       );
       Some(security)
     } else {

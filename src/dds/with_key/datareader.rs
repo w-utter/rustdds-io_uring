@@ -891,8 +891,8 @@ where
     }
   }
   fn lock_datareader(&self) -> ReadResult<MutexGuard<DataReader<D, DA>>> {
-    self.datareader.lock().map_err(|_e| ReadError::Poisoned {
-      reason: "DataReaderStream could not lock datareader: {e:?}".to_string(),
+    self.datareader.lock().map_err(|e| ReadError::Poisoned {
+      reason: format!("BareDataReaderStream could not lock datareader: {e:?}"),
     })
   }
 }
@@ -983,8 +983,8 @@ where
     }
   }
   fn lock_datareader(&self) -> ReadResult<MutexGuard<DataReader<D, DA>>> {
-    self.datareader.lock().map_err(|_e| ReadError::Poisoned {
-      reason: "DataReaderStream could not lock datareader: {e:?}".to_string(),
+    self.datareader.lock().map_err(|e| ReadError::Poisoned {
+      reason: format!("DataReaderStream could not lock datareader: {e:?}"),
     })
   }
 }
@@ -1070,8 +1070,8 @@ where
   DA: DeserializerAdapter<D>,
 {
   fn lock_datareader(&self) -> ReadResult<MutexGuard<DataReader<D, DA>>> {
-    self.datareader.lock().map_err(|_e| ReadError::Poisoned {
-      reason: "DataReaderEventStream could not lock datareader: {e:?}".to_string(),
+    self.datareader.lock().map_err(|e| ReadError::Poisoned {
+      reason: format!("DataReaderEventStream could not lock datareader: {e:?}"),
     })
   }
 }

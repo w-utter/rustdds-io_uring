@@ -333,8 +333,8 @@ impl From<BuiltinCryptoHeader> for CryptoHeader {
   }
 }
 
-/// CryptoContent type from section 9.5.2.4 of the Security specification (v.
-/// 1.1)
+// CryptoContent type from section 9.5.2.4 of the Security specification (v.
+// 1.1)
 //pub(super) type BuiltinCryptoContent = CryptoContent;
 
 pub(super) const MAC_LENGTH: usize = 16;

@@ -78,7 +78,7 @@ impl CryptographicBuiltin {
           .name
           .eq(VOLATILE_ENDPOINT_RECOGNITION_PROPERTY_NAME)
       })
-      .map_or(false, |property| {
+      .is_some_and(|property| {
         property
           .value
           .eq(VOLATILE_WRITER_RECOGNITION_PROPERTY_VALUE)

@@ -247,9 +247,7 @@ impl SecurityPlugins {
     self
       .local_endpoint_crypto_handle_cache
       .get(guid)
-      .map_or(false, |found_handle| {
-        local_endpoint_crypto_handles.contains(found_handle)
-      })
+      .is_some_and(|found_handle| local_endpoint_crypto_handles.contains(found_handle))
   }
 
   /// The `local_proxy_guid_pair` should be `&(local_endpoint_guid,
