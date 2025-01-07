@@ -289,15 +289,17 @@ impl TopicCache {
     end_instant: Timestamp,
   ) -> Box<dyn Iterator<Item = (Timestamp, &CacheChange)> + '_> {
     // Sanity check
-    let start_instant = 
-      if start_instant <= end_instant { 
-        // sane case
-        start_instant 
-      } else {
-        // insane case
-        error!("get_changes_in_range_best_effort: Did my clock jump backwards? start={start_instant:?} end={end_instant:?}");
-        end_instant
-      };
+    let start_instant = if start_instant <= end_instant {
+      // sane case
+      start_instant
+    } else {
+      // insane case
+      error!(
+        "get_changes_in_range_best_effort: Did my clock jump backwards? start={start_instant:?} \
+         end={end_instant:?}"
+      );
+      end_instant
+    };
 
     // Get result as tree range
     Box::new(

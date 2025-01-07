@@ -749,9 +749,9 @@ impl DiscoveryDB {
 
   // // TODO: return iterator somehow?
   #[cfg(test)] // used only for testing
-  pub fn get_local_topic_readers<'a, T: TopicDescription>(
-    &'a self,
-    topic: &'a T,
+  pub fn get_local_topic_readers<T: TopicDescription>(
+    &self,
+    topic: &T,
   ) -> Vec<&DiscoveredReaderData> {
     let topic_name = topic.name();
     self
