@@ -1,10 +1,10 @@
 # RustDDS
 
-![continuous-integration](https://github.com/jhelovuo/RustDDS/actions/workflows/CI.yml/badge.svg)
-[![codecov](https://codecov.io/gh/jhelovuo/RustDDS/branch/master/graph/badge.svg)](https://codecov.io/gh/jhelovuo/RustDDS)
+![continuous-integration](https://github.com/Atostek/RustDDS/actions/workflows/CI.yml/badge.svg)
+[![codecov](https://codecov.io/gh/Atostek/RustDDS/branch/master/graph/badge.svg)](https://codecov.io/gh/Atostek/RustDDS)
 
 [RustDDS][rustdds-url] is a pure Rust implementation of [Data Distribution Service](https://www.omg.org/spec/DDS/). The latest [released version](https://crates.io/crates/rustdds) 
-is available on [crates.io](https://crates.io/) and API documentation on [docs.rs](https://docs.rs/rustdds/latest/rustdds/). The [GitHub repository](https://github.com/jhelovuo/RustDDS) tracks development.
+is available on [crates.io](https://crates.io/) and API documentation on [docs.rs](https://docs.rs/rustdds/latest/rustdds/). The [GitHub repository](https://github.com/Atostek/RustDDS) tracks development.
 
 RustDDS is developed by [Atostek Oy][atostek-url]. Atostek provides support and software development services related to DDS, ROS2, and robotics software in general. As a part of our work, we have open-sourced the RustDDS implementation.
 
@@ -23,6 +23,13 @@ The [ros2-client](https://crates.io/crates/ros2-client) is recommended for talki
 ## Version 0.11.0
 * `DataReaderStream` sample stream now returns full `DataSample`, including sample metadata 
 (`SampleInfo`). The old version returned only bare data value. You can access the old (simpler and faster) async stream as `BareDataReaderStream`.
+
+### Version 0.11.1
+* Improve interoperability in DDS-RPC. Inline QoS parameter `RELATED_SAMPLE_IDENTITY` apparently has two encodings in practical use. Fixes interoperability with new eProsima FastDDS versions.
+
+### Version 0.11.2
+* Fix possible panic if system clock jumps backward.
+* Fix Writer history garbage collection.
 
 ## Version 0.10.0
 The `DeserializerAdpter` interface for attaching serialization formats to RTPS was extended
@@ -139,6 +146,7 @@ Using "Shapes" demo programs available. Data exchange worked in both directions:
 * RTI Connext
 * eProsima FastRTPS
 * OpenDDS
+* CycloneDDS
 * Twin Oaks Computing
 
 # Usage
