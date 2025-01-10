@@ -417,7 +417,9 @@ impl TopicCache {
     // Now, reallocate old cache changes
     let reallocate_timeout = crate::Duration::from_secs(5);
     let now = Timestamp::now();
-    let reallocate_limit = now - reallocate_timeout;
+
+    // Take max to avoid crash if clock jumps backward.
+    let reallocate_limit = max(now - reallocate_timeout, self.changes_reallocated_up_to);
 
     self
       .changes
