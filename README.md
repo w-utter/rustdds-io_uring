@@ -31,6 +31,9 @@ The [ros2-client](https://crates.io/crates/ros2-client) is recommended for talki
 * Fix possible panic if system clock jumps backward.
 * Fix Writer history garbage collection.
 
+### Version 0.11.3
+* Fix bug revealed by improvements in 0.11.2
+
 ## Version 0.10.0
 The `DeserializerAdpter` interface for attaching serialization formats to RTPS was extended
 to support deserialization with a "seed" value. This allows the deserialization process
