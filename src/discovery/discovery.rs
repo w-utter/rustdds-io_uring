@@ -340,6 +340,12 @@ impl Discovery {
           &discovery_subscriber_qos
         };
 
+        let publisher_qos: QosPolicies = if let Some(qos) = endpoint_qos_opt_bind.as_ref() {
+          qos.clone()
+        } else {
+          discovery_publisher_qos.clone()
+        };
+
         let topic = domain_participant
           .create_topic(
             $topic_name.to_string(),
@@ -364,7 +370,7 @@ impl Discovery {
                 ::<$message_type, [<$repr SerializerAdapter>] <$message_type>>(
                 $writer_entity_id,
                 &topic,
-                $endpoint_qos_opt,
+                Some(publisher_qos),
                 $stateless_RTPS,
               ).expect("Unable to create DataWriter .");
         }
@@ -1857,6 +1863,8 @@ impl Discovery {
   }
 
   pub fn subscriber_qos() -> QosPolicies {
+    // The Subscriber QoS is specified in DDS Spec v1.4 Section
+    // "2.2.5 Built-in Topics"
     QosPolicyBuilder::new()
       .durability(Durability::TransientLocal)
       .presentation(Presentation {
@@ -1877,6 +1885,10 @@ impl Discovery {
       })
       .destination_order(DestinationOrder::ByReceptionTimestamp)
       .history(History::KeepLast { depth: 1 })
+      // TODO:
+      // Spec says all resource limits should be "LENGTH_UNLIMITED",
+      // but that may lead to memory exhaustion.
+      //
       // .resource_limits(ResourceLimits { // TODO: Maybe lower limits would suffice?
       //   max_instances: std::i32::MAX,
       //   max_samples: std::i32::MAX,
@@ -1885,8 +1897,12 @@ impl Discovery {
       .build()
   }
 
-  // TODO: Check if this definition is correct (spec?)
   pub fn publisher_qos() -> QosPolicies {
+    // TODO: Check if this definition is correct (spec?)
+    // Problem: DDS spec v1.4 Section 2.2.5 gives Subscriber QoS policies,
+    // but does not mention publisher QoS for built-in topics.
+    //
+    //
     QosPolicyBuilder::new()
       .durability(Durability::TransientLocal)
       .presentation(Presentation {
@@ -1906,7 +1922,10 @@ impl Discovery {
         max_blocking_time: Duration::from_std(StdDuration::from_millis(100)),
       })
       .destination_order(DestinationOrder::ByReceptionTimestamp)
-      .history(History::KeepLast { depth: 1 })
+      // History must be different from Subscriber side, because otherwise
+      // only the latest created Reder/Writer/Topic will be buffered and the older
+      // ones forgotten.
+      .history(History::KeepAll)
       // .resource_limits(ResourceLimits { // TODO: Maybe lower limits would suffice?
       //   max_instances: std::i32::MAX,
       //   max_samples: std::i32::MAX,

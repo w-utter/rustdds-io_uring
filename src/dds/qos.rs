@@ -694,6 +694,15 @@ pub mod policy {
   }
 
   /// DDS 2.2.3.4 DURABILITY
+  ///
+  /// DDS Spec 1.4:
+  ///
+  /// "This QoS policy controls whether the Service will actually make data
+  /// available to late-joining readers. Note that although related, this does
+  /// not strictly control what data the Service will maintain internally. That
+  /// is, the Service may choose to maintain some data for its own purposes
+  /// (e.g., flow control) and yet not make it available to late-joining readers
+  /// if the DURABILITY QoS policy is set to VOLATILE."
   #[derive(
     Copy,
     Clone,

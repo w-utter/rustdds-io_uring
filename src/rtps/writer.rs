@@ -196,11 +196,17 @@ impl HistoryBuffer {
 
   fn remove_changes_before(&mut self, remove_before_seq: SequenceNumber) {
     if let Some(remove_before) = self.sequence_number_to_instant.get(&remove_before_seq) {
+      let count_before = self.history_buffer.len();
       self.history_buffer = self.history_buffer.split_off(remove_before);
       self.sequence_number_to_instant = self
         .sequence_number_to_instant
         .split_off(&remove_before_seq);
-
+      // debug printout
+      let count_after = self.history_buffer.len();
+      debug!(
+        "HistoryBuffer: remove_changes_before. count before={} after={}, topic={}",
+        count_before, count_after, self.topic_name
+      );
       if remove_before_seq >= self.first_seq {
         self.first_seq = remove_before_seq; // update
       } else {
@@ -1405,7 +1411,7 @@ impl Writer {
       ),
       SequenceNumber::zero(),
     );
-    warn!(
+    debug!(
       "HistoryBuffer: cleaning before {first_keeper:?} topic={:?}",
       self.topic_name()
     );
