@@ -9,3 +9,5 @@ src/.vscode/launch.json
 .idea/
 logging-config.yaml
 dev
+/2/
+/VM-security-items/
