@@ -227,9 +227,9 @@ pub struct BuiltInTopicKey {
 
 impl BuiltInTopicKey {
   pub fn random_key() -> Self {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     Self {
-      value: [rng.gen(), rng.gen(), rng.gen()],
+      value: [rng.random(), rng.random(), rng.random()],
     }
   }
 }

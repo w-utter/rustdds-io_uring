@@ -199,18 +199,18 @@ fn main() {
     shape_size: 21,
   };
 
-  let mut random_gen = thread_rng();
+  let mut random_gen = rand::rng();
   // A bit complicated lottery to ensure we do not end up with zero velocity,
   // because that would make a boring demo.
-  let mut x_vel = if random() {
-    random_gen.gen_range(1..5)
+  let mut x_vel = if rand::random() {
+    random_gen.random_range(1..5)
   } else {
-    random_gen.gen_range(-5..-1)
+    random_gen.random_range(-5..-1)
   };
-  let mut y_vel = if random() {
-    random_gen.gen_range(1..5)
+  let mut y_vel = if rand::random() {
+    random_gen.random_range(1..5)
   } else {
-    random_gen.gen_range(-5..-1)
+    random_gen.random_range(-5..-1)
   };
 
   let dp_event_loop = async {
