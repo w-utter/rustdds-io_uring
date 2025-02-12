@@ -332,7 +332,7 @@ where
 {
   // Construct an empty set from given base number
   pub fn new(bitmap_base: N, num_bits: u32) -> Self {
-    let word_count = (num_bits + 31) / 32;
+    let word_count = num_bits.div_ceil(32);
     Self {
       bitmap_base,
       num_bits,
@@ -441,7 +441,7 @@ where
   pub fn len_serialized(&self) -> usize {
     size_of::<N>() // base
     + 4 // num_bits
-    + 4 * ((self.num_bits as usize +31)/32) // bitmap
+    + 4 * (self.num_bits as usize).div_ceil(32) // bitmap
   }
 }
 
@@ -462,7 +462,7 @@ where
       // Without this chek the addition operation below could overflow.
       Err(speedy::Error::custom(format!("NumberSet size too large: {} > 256.", num_bits)).into())
     } else {
-      let word_count = (num_bits + 31) / 32;
+      let word_count = num_bits.div_ceil(32);
       let mut bitmap: Vec<u32> = Vec::with_capacity(word_count as usize);
       for _ in 0..word_count {
         bitmap.push(reader.read_value()?);
@@ -489,7 +489,7 @@ where
   fn write_to<T: ?Sized + Writer<C>>(&self, writer: &mut T) -> Result<(), C::Error> {
     writer.write_value(&self.bitmap_base)?;
     writer.write_u32(self.num_bits)?;
-    let word_count = (self.num_bits + 31) / 32;
+    let word_count = self.num_bits.div_ceil(32);
     let bitmap_len = self.bitmap.len() as u32;
     // sanity check
     if bitmap_len != word_count {
