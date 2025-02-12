@@ -13,10 +13,10 @@ readme = "README.md"
 keywords = ["network","protocol","dds","rtps"]
 license = "Apache-2.0"
 edition = "2021"
+rust-version = "1.73.0"
 homepage = "https://atostek.com/en/products/rustdds/"  
 repository = "https://github.com/Atostek/RustDDS"
 categories = ["network-programming", "science::robotics"] 
-rust-version = "1.70.0"
 # the science-robotics category is because of ROS2
 
 [features]
@@ -80,7 +80,7 @@ cms = { version = "0.2" , optional = true } # for ASN.1 parsing
 der = { version = "0.7" , optional = true } # ASN.1 DER encoding
 bcder = { version = "0.7" , optional = true } # ASN.1 DER encoding
 const-oid = { version = "0.9" , optional = true } # more ASN.1
-openssl = { version = "0.10", optional = true }
+openssl = { version = "0.10.70", optional = true }
 cryptoki = { version = "0.8", optional = true }
 
 
