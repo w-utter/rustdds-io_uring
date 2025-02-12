@@ -1,6 +1,9 @@
 # RustDDS
+![static checks](https://github.com/Atostek/RustDDS/actions/workflows/static-checks.yml/badge.svg)
+![tests on Ubuntu](https://github.com/Atostek/RustDDS/actions/workflows/tests.yml/badge.svg)
+![tests on macOS](https://github.com/Atostek/RustDDS/actions/workflows/tests-macos.yml/badge.svg)
+![audit](https://github.com/Atostek/RustDDS/actions/workflows/audit.yml/badge.svg)
 
-![continuous-integration](https://github.com/Atostek/RustDDS/actions/workflows/CI.yml/badge.svg)
 [![codecov](https://codecov.io/gh/Atostek/RustDDS/branch/master/graph/badge.svg)](https://codecov.io/gh/Atostek/RustDDS)
 
 [RustDDS][rustdds-url] is a pure Rust implementation of [Data Distribution Service](https://www.omg.org/spec/DDS/). The latest [released version](https://crates.io/crates/rustdds) 

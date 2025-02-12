@@ -3,7 +3,7 @@ on:
     branches: [master]
   pull_request:
 
-name: Continuous integration
+name: CI / Static Checks
 
 jobs:
 
@@ -17,12 +17,12 @@ jobs:
           components: rustfmt
       - run: cargo fmt -- --check
 
-  test:
+  doc:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo test -- --test-threads=1
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo doc
 
   clippy:
     name: lint
@@ -41,5 +41,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.80.0
+      - uses: dtolnay/rust-toolchain@1.82.0
       - run: cargo check
