@@ -942,6 +942,7 @@ where
 //
 
 // A future for an asynchronous write operation
+#[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct AsyncWrite<'a, D, SA>
 where
   D: Keyed,
@@ -1026,6 +1027,7 @@ where
 // A future for an asynchronous operation of waiting for acknowledgements.
 // Handles both the sending of the WaitForAcknowledgments command and
 // the waiting for the acknowledgements.
+#[must_use = "futures do nothing unless you `.await` or poll them"]
 pub enum AsyncWaitForAcknowledgments<'a, D, SA>
 where
   D: Keyed,
