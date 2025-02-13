@@ -1,10 +1,9 @@
 # RustDDS
-![static checks](https://github.com/Atostek/RustDDS/actions/workflows/static-checks.yml/badge.svg)
-![tests on Ubuntu](https://github.com/Atostek/RustDDS/actions/workflows/tests.yml/badge.svg)
-![tests on macOS](https://github.com/Atostek/RustDDS/actions/workflows/tests-macos.yml/badge.svg)
-![audit](https://github.com/Atostek/RustDDS/actions/workflows/audit.yml/badge.svg)
+[![Static Checks](https://github.com/Atostek/RustDDS/actions/workflows/static-checks.yml/badge.svg)](https://github.com/Atostek/RustDDS/actions/workflows/static-checks.yml)
+[![Tests on Ubuntu](https://github.com/Atostek/RustDDS/actions/workflows/tests.yml/badge.svg)](https://github.com/Atostek/RustDDS/actions/workflows/tests.yml)
+[![Tests on macOS](https://github.com/Atostek/RustDDS/actions/workflows/tests-macos.yml/badge.svg)](https://github.com/Atostek/RustDDS/actions/workflows/tests-macos.yml)
+[![Security audit](https://github.com/Atostek/RustDDS/actions/workflows/audit.yml/badge.svg)](https://github.com/Atostek/RustDDS/actions/workflows/audit.yml)
 
-[![codecov](https://codecov.io/gh/Atostek/RustDDS/branch/master/graph/badge.svg)](https://codecov.io/gh/Atostek/RustDDS)
 
 [RustDDS][rustdds-url] is a pure Rust implementation of [Data Distribution Service](https://www.omg.org/spec/DDS/). The latest [released version](https://crates.io/crates/rustdds) 
 is available on [crates.io](https://crates.io/) and API documentation on [docs.rs](https://docs.rs/rustdds/latest/rustdds/). The [GitHub repository](https://github.com/Atostek/RustDDS) tracks development.
