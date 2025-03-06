@@ -478,7 +478,7 @@ impl Writer {
               let delay_to_next_repair = self
                 .qos_policies
                 .deadline()
-                .map_or_else(|| Duration::from_millis(100), |dl| dl.0)
+                .map_or_else(|| Duration::from_millis(10), |dl| dl.0)
                 / 5;
               self.timed_event_timer.set_timeout(
                 std::time::Duration::from(delay_to_next_repair),
