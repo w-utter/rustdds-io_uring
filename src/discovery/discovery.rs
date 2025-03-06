@@ -1884,7 +1884,10 @@ impl Discovery {
         max_blocking_time: Duration::from_std(StdDuration::from_millis(100)),
       })
       .destination_order(DestinationOrder::ByReceptionTimestamp)
-      .history(History::KeepLast { depth: 1 })
+      // Spec gives History KeepLast depth = 1, but we
+      // use somewhat higher to avoid losing data at the receiver in case
+      // it comes in bursts and there is some delay in Discovery processing.
+      .history(History::KeepLast { depth: 4 })
       // TODO:
       // Spec says all resource limits should be "LENGTH_UNLIMITED",
       // but that may lead to memory exhaustion.
@@ -1934,10 +1937,15 @@ impl Discovery {
       .build()
   }
 
+  // This is (partially) gven in DDS Spec v1.4 Section 8.5.3.3.1 SPDPbuiltinParticipantWriter
+  // Table 8.79 - Attributes of the RTPS StatelessWriter used by the SPDP
+  // at least that is is BestEffort.
   pub fn create_spdp_participant_qos() -> QosPolicies {
     QosPolicyBuilder::new()
       .reliability(Reliability::BestEffort)
-      .history(History::KeepLast { depth: 1 })
+      // Use depth=8 to avoid losing data when we receive notifications
+      // faster than we can process.
+      .history(History::KeepLast { depth: 8 })
       .build()
   }
 
