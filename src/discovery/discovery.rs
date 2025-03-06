@@ -43,6 +43,29 @@ use crate::{
   with_key::{DataReader, DataWriter, Sample},
   DomainParticipant,
 };
+// This module implements the control logic of the Discovery process.
+//
+// The built-in discovery consists of
+// Simple Participant Discovery Protocol (SPDP), (RTPS spec v2.5
+// Section "8.5.3 The Simple Participant Discovery Protocol") and
+// Simple Endpoint Discovery Protocol (SEDP) (RTPS spec v2.5
+// Section "8.5.4 The Simple Endpoint Discovery Protocol")
+//
+// Notes:
+//
+// SPDP is periodically broadcast from each DomainParticipant to announce presence to others.
+// It is essentially stateless and best-effort. It also announces built-in endpoints.
+// See module spdp_participant_data for details.
+//
+// SEDP is Reliable transfer of user-defined endpoints (Readers, Writers and Topics).
+// Many DDS implementations do not communicate Topics at all, and seem to work just fine.
+//
+// "Participant Message" protocol is NOT the same as SPDP. See RTPS spec v2.5 Section
+// "8.4.13 Writer Liveliness Protocol". It can be used as liveliness (hearbeat)
+// signalling of individual Writers.
+//
+// "Participant Stateless Message" and "Participant Volatile Message" only appear
+// in Secure RTPS. Please see the RTPS Security specification for explanation.
 #[cfg(feature = "security")]
 use crate::{
   discovery::secure_discovery::SecureDiscovery,
@@ -695,8 +718,8 @@ impl Discovery {
     self.initialize_participant();
 
     // send out info about non-built-in Writers and Readers that we have.
-    self.write_writers_info();
-    self.write_readers_info();
+    self.sedp_publish_writers();
+    self.sedp_publish_readers();
 
     match self.discovery_started_sender.send(Ok(())) {
       Ok(_) => (),
@@ -731,13 +754,13 @@ impl Discovery {
                   return; // terminate event loop
                 }
                 DiscoveryCommand::AddLocalWriter { guid } => {
-                  self.write_single_writer_info(guid);
+                  self.sedp_publish_single_writer(guid);
                 }
                 DiscoveryCommand::AddLocalReader { guid } => {
-                  self.write_single_reader_info(guid);
+                  self.sedp_publish_single_reader(guid);
                 }
                 DiscoveryCommand::AddTopic { topic_name } => {
-                  self.write_topic_info(&topic_name);
+                  self.sedp_publish_topic(&topic_name);
                 }
                 DiscoveryCommand::RemoveLocalWriter { guid } => {
                   if guid == self.dcps_publication.writer.guid() {
@@ -801,7 +824,7 @@ impl Discovery {
 
           DISCOVERY_PARTICIPANT_DATA_TOKEN => {
             debug!("triggered participant reader");
-            self.handle_participant_reader();
+            self.spdp_receive();
           }
 
           DISCOVERY_PARTICIPANT_CLEANUP_TOKEN => {
@@ -814,7 +837,7 @@ impl Discovery {
 
           DISCOVERY_SEND_PARTICIPANT_INFO_TOKEN => {
             if let Some(dp) = self.domain_participant.clone().upgrade() {
-              self.send_participant_info(&dp);
+              self.spdp_publish(&dp);
             } else {
               error!("DomainParticipant doesn't exist anymore, exiting Discovery.");
               return;
@@ -826,13 +849,13 @@ impl Discovery {
               .set_timeout(Self::SEND_PARTICIPANT_INFO_PERIOD, ());
           }
           DISCOVERY_READER_DATA_TOKEN => {
-            self.handle_subscription_reader(None);
+            self.sedp_receive_subscription(None);
           }
           DISCOVERY_WRITER_DATA_TOKEN => {
-            self.handle_publication_reader(None);
+            self.sedp_receive_publication(None);
           }
           DISCOVERY_TOPIC_DATA_TOKEN => {
-            self.handle_topic_reader(None);
+            self.sedp_receive_topic_data(None);
           }
           DISCOVERY_TOPIC_CLEANUP_TOKEN => {
             self.topic_cleanup();
@@ -842,10 +865,10 @@ impl Discovery {
               .set_timeout(Self::TOPIC_CLEANUP_PERIOD, ());
           }
           DISCOVERY_PARTICIPANT_MESSAGE_TOKEN | P2P_SECURE_DISCOVERY_PARTICIPANT_MESSAGE_TOKEN => {
-            self.handle_participant_message_reader();
+            self.receive_participant_message();
           }
           DISCOVERY_PARTICIPANT_MESSAGE_TIMER_TOKEN => {
-            self.write_participant_message();
+            self.publish_participant_message();
             self
               .dcps_participant_message
               .timer
@@ -858,7 +881,7 @@ impl Discovery {
           }
           P2P_PARTICIPANT_STATELESS_MESSAGE_TOKEN => {
             #[cfg(feature = "security")]
-            self.handle_participant_stateless_message_reader();
+            self.receive_participant_stateless_message();
           }
           CACHED_SECURE_DISCOVERY_MESSAGE_RESEND_TIMER_TOKEN => {
             #[cfg(feature = "security")]
@@ -866,19 +889,19 @@ impl Discovery {
           }
           P2P_BUILTIN_PARTICIPANT_VOLATILE_SECURE_TOKEN => {
             #[cfg(feature = "security")]
-            self.handle_volatile_message_secure_reader();
+            self.receive_participant_volatile_message();
           }
           SECURE_DISCOVERY_PARTICIPANT_DATA_TOKEN => {
             #[cfg(feature = "security")]
-            self.handle_secure_participant_reader();
+            self.secure_spdp_receive();
           }
           SECURE_DISCOVERY_READER_DATA_TOKEN => {
             #[cfg(feature = "security")]
-            self.handle_secure_subscription_reader(None);
+            self.secure_sedp_receive_subscription(None);
           }
           SECURE_DISCOVERY_WRITER_DATA_TOKEN => {
             #[cfg(feature = "security")]
-            self.handle_secure_publication_reader(None);
+            self.secure_sedp_receive_publication(None);
           }
 
           other_token => {
@@ -920,10 +943,10 @@ impl Discovery {
     });
   }
 
-  pub fn handle_participant_reader(&mut self) {
+  pub fn spdp_receive(&mut self) {
     loop {
       let s = self.dcps_participant.reader.take_next_sample();
-      debug!("handle_participant_reader read {:?}", &s);
+      debug!("spdp_receive read {:?}", &s);
       match s {
         Ok(Some(ds)) => {
           #[cfg(not(feature = "security"))]
@@ -948,10 +971,7 @@ impl Discovery {
           if permission == NormalDiscoveryPermission::Allow {
             match ds.value {
               Sample::Value(participant_data) => {
-                debug!(
-                  "handle_participant_reader discovered {:?}",
-                  &participant_data
-                );
+                debug!("spdp_receive discovered {:?}", &participant_data);
                 self.process_discovered_participant_data(&participant_data);
               }
               // Sample::Dispose means that DomainParticipant was disposed
@@ -962,11 +982,11 @@ impl Discovery {
           }
         }
         Ok(None) => {
-          trace!("handle_participant_reader: no more data");
+          trace!("spdp_receive: no more data");
           return;
         } // no more data
         Err(e) => {
-          error!(" !!! handle_participant_reader: {e:?}");
+          error!(" !!! spdp_receive: {e:?}");
           return;
         }
       }
@@ -987,9 +1007,9 @@ impl Discovery {
       // was temporarily lost due to network outage. Check if we already know
       // what it has (readers, writers, topics).
       debug!("Participant rediscovery start");
-      self.handle_topic_reader(Some(guid_prefix));
-      self.handle_subscription_reader(Some(guid_prefix));
-      self.handle_publication_reader(Some(guid_prefix));
+      self.sedp_receive_topic_data(Some(guid_prefix));
+      self.sedp_receive_subscription(Some(guid_prefix));
+      self.sedp_receive_publication(Some(guid_prefix));
       debug!("Participant rediscovery finished");
     }
   }
@@ -1060,7 +1080,7 @@ impl Discovery {
   }
 
   // Check if there are messages about new Readers
-  pub fn handle_subscription_reader(&mut self, read_history: Option<GuidPrefix>) {
+  pub fn sedp_receive_subscription(&mut self, read_history: Option<GuidPrefix>) {
     let drds: Vec<Sample<DiscoveredReaderData, GUID>> =
       match self.dcps_subscription.reader.into_iterator() {
         Ok(ds) => ds
@@ -1076,7 +1096,7 @@ impl Discovery {
               })
           .collect(),
         Err(e) => {
-          error!("handle_subscription_reader: {e:?}");
+          error!("sedp_receive_subscription: {e:?}");
           return;
         }
       };
@@ -1099,7 +1119,7 @@ impl Discovery {
           Sample::Value(d) => {
             let drd = discovery_db_write(&self.discovery_db).update_subscription(&d);
             debug!(
-              "handle_subscription_reader - send_discovery_notification ReaderUpdated  {:?}",
+              "sedp_receive_subscription - send_discovery_notification ReaderUpdated  {:?}",
               &drd
             );
             self.send_discovery_notification(DiscoveryNotificationType::ReaderUpdated {
@@ -1129,7 +1149,7 @@ impl Discovery {
     } // loop
   }
 
-  pub fn handle_publication_reader(&mut self, read_history: Option<GuidPrefix>) {
+  pub fn sedp_receive_publication(&mut self, read_history: Option<GuidPrefix>) {
     let dwds: Vec<Sample<DiscoveredWriterData, GUID>> =
       match self.dcps_publication.reader.into_iterator() {
         // a lot of cloning here, but we must copy the data out of the
@@ -1149,7 +1169,7 @@ impl Discovery {
           })
           .collect(),
         Err(e) => {
-          error!("handle_publication_reader: {e:?}");
+          error!("sedp_receive_publication: {e:?}");
           return;
         }
       };
@@ -1170,7 +1190,7 @@ impl Discovery {
       if permission == NormalDiscoveryPermission::Allow {
         match d {
           Sample::Value(dwd) => {
-            trace!("handle_publication_reader discovered {:?}", &dwd);
+            trace!("sedp_receive_publication discovered {:?}", &dwd);
             let discovered_writer_data =
               discovery_db_write(&self.discovery_db).update_publication(&dwd);
             self.send_discovery_notification(DiscoveryNotificationType::WriterUpdated {
@@ -1200,7 +1220,7 @@ impl Discovery {
   // Likely it is something to do with an unreliable network and
   // DomainParticipants timing out and then coming back. The read_history was
   // supposed to help in recovering from that.
-  pub fn handle_topic_reader(&mut self, _read_history: Option<GuidPrefix>) {
+  pub fn sedp_receive_topic_data(&mut self, _read_history: Option<GuidPrefix>) {
     let ts: Vec<Sample<(DiscoveredTopicData, GUID), GUID>> = match self
       .dcps_topic
       .reader
@@ -1216,7 +1236,7 @@ impl Discovery {
         })
         .collect(),
       Err(e) => {
-        error!("handle_topic_reader: {e:?}");
+        error!("sedp_receive_topic_data: {e:?}");
         return;
       }
     };
@@ -1237,7 +1257,7 @@ impl Discovery {
       if permission == NormalDiscoveryPermission::Allow {
         match t {
           Sample::Value((topic_data, writer)) => {
-            debug!("handle_topic_reader discovered {:?}", &topic_data);
+            debug!("sedp_receive_topic_data discovered {:?}", &topic_data);
             discovery_db_write(&self.discovery_db).update_topic_data(
               &topic_data,
               writer,
@@ -1281,7 +1301,7 @@ impl Discovery {
   // These messages are for updating participant liveliness
   // The protocol distinguishes between automatic (by DDS library)
   // and manual (by by application, via DDS API call) liveness
-  pub fn handle_participant_message_reader(&mut self) {
+  pub fn receive_participant_message(&mut self) {
     // First read from nonsecure reader
     let mut samples = match self
       .dcps_participant_message
@@ -1290,7 +1310,7 @@ impl Discovery {
     {
       Ok(nonsecure_samples) => nonsecure_samples,
       Err(e) => {
-        error!("handle_participant_message_reader: {e:?}");
+        error!("receive_participant_message: {e:?}");
         return;
       }
     };
@@ -1306,7 +1326,7 @@ impl Discovery {
     {
       Ok(secure_samples) => secure_samples,
       Err(e) => {
-        error!("Secure handle_participant_message_reader: {e:?}");
+        error!("Secure receive_participant_message: {e:?}");
         return;
       }
     };
@@ -1323,7 +1343,7 @@ impl Discovery {
     }
   }
 
-  fn send_participant_info(&self, local_dp: &DomainParticipant) {
+  fn spdp_publish(&self, local_dp: &DomainParticipant) {
     // setting 5 times the duration so lease doesn't break if update fails once or
     // twice
     let data = SpdpDiscoveredParticipantData::from_local_participant(
@@ -1334,7 +1354,7 @@ impl Discovery {
 
     #[cfg(feature = "security")]
     if let Some(security) = self.security_opt.as_ref() {
-      security.send_secure_participant_info(&self.dcps_participant_secure.writer, data.clone());
+      security.secure_spdp_publish(&self.dcps_participant_secure.writer, data.clone());
     }
 
     self
@@ -1346,7 +1366,7 @@ impl Discovery {
       });
   }
 
-  pub fn write_participant_message(&mut self) {
+  pub fn publish_participant_message(&mut self) {
     // Inspect if we need to send liveness messages
     // See 8.4.13.5 "Implementing Writer Liveliness Protocol .." in the RPTS spec
 
@@ -1450,7 +1470,7 @@ impl Discovery {
   }
 
   #[cfg(feature = "security")]
-  fn handle_participant_stateless_message_reader(&mut self) {
+  fn receive_participant_stateless_message(&mut self) {
     if let Some(security) = self.security_opt.as_mut() {
       // Security enabled. Get messages from the stateless data reader & feed to
       // Secure Discovery.
@@ -1470,14 +1490,14 @@ impl Discovery {
           }
         }
         Err(e) => {
-          error!("handle_participant_stateless_message_reader: {e:?}");
+          error!("receive_participant_stateless_message: {e:?}");
         }
       };
     }
   }
 
   #[cfg(feature = "security")]
-  fn handle_volatile_message_secure_reader(&mut self) {
+  fn receive_participant_volatile_message(&mut self) {
     if let Some(security) = self.security_opt.as_mut() {
       // Security enabled. Get messages from the volatile message reader & feed to
       // Secure Discovery.
@@ -1492,18 +1512,18 @@ impl Discovery {
           }
         }
         Err(e) => {
-          error!("handle_volatile_message_secure_reader: {e:?}");
+          error!("receive_participant_volatile_message: {e:?}");
         }
       };
     }
   }
 
   #[cfg(feature = "security")]
-  pub fn handle_secure_participant_reader(&mut self) {
+  pub fn secure_spdp_receive(&mut self) {
     let sample_iter = match self.dcps_participant_secure.reader.into_iterator() {
       Ok(iter) => iter,
       Err(e) => {
-        error!("handle_secure_participant_reader: {e:?}");
+        error!("secure_spdp_receive: {e:?}");
         return;
       }
     };
@@ -1516,7 +1536,7 @@ impl Discovery {
           &self.discovery_updated_sender,
         )
       } else {
-        debug!("In handle_secure_participant_reader even though security not enabled?");
+        debug!("In secure_spdp_receive even though security not enabled?");
         return;
       };
 
@@ -1536,7 +1556,7 @@ impl Discovery {
   }
 
   #[cfg(feature = "security")]
-  pub fn handle_secure_subscription_reader(&mut self, read_history: Option<GuidPrefix>) {
+  pub fn secure_sedp_receive_subscription(&mut self, read_history: Option<GuidPrefix>) {
     let sec_subs: Vec<Sample<SubscriptionBuiltinTopicDataSecure, GUID>> =
       match self.dcps_subscriptions_secure.reader.into_iterator() {
         Ok(ds) => ds
@@ -1552,7 +1572,7 @@ impl Discovery {
               })
           .collect(),
         Err(e) => {
-          error!("handle_secure_subscription_reader: {e:?}");
+          error!("secure_sedp_receive_subscription: {e:?}");
           return;
         }
       };
@@ -1561,7 +1581,7 @@ impl Discovery {
       let permission = if let Some(security) = self.security_opt.as_mut() {
         security.check_secure_subscription_read(&sec_sub_sample, &self.discovery_db)
       } else {
-        debug!("In handle_secure_subscription_reader even though security not enabled?");
+        debug!("In secure_sedp_receive_subscription even though security not enabled?");
         return;
       };
 
@@ -1590,7 +1610,7 @@ impl Discovery {
   }
 
   #[cfg(feature = "security")]
-  pub fn handle_secure_publication_reader(&mut self, read_history: Option<GuidPrefix>) {
+  pub fn secure_sedp_receive_publication(&mut self, read_history: Option<GuidPrefix>) {
     let sec_pubs: Vec<Sample<PublicationBuiltinTopicDataSecure, GUID>> =
       match self.dcps_publications_secure.reader.into_iterator() {
         Ok(ds) => ds
@@ -1612,7 +1632,7 @@ impl Discovery {
           })
           .collect(),
         Err(e) => {
-          error!("handle_secure_publication_reader: {e:?}");
+          error!("secure_sedp_receive_publication: {e:?}");
           return;
         }
       };
@@ -1621,7 +1641,7 @@ impl Discovery {
       let permission = if let Some(security) = self.security_opt.as_mut() {
         security.check_secure_publication_read(&sec_pub_sample, &self.discovery_db)
       } else {
-        debug!("In handle_secure_publication_reader even though security not enabled?");
+        debug!("In secure_sedp_receive_publication even though security not enabled?");
         return;
       };
 
@@ -1681,7 +1701,7 @@ impl Discovery {
     discovery_db_write(&self.discovery_db).topic_cleanup();
   }
 
-  pub fn write_single_reader_info(&self, guid: GUID) {
+  pub fn sedp_publish_single_reader(&self, guid: GUID) {
     let db = discovery_db_read(&self.discovery_db);
     if let Some(reader_data) = db.get_local_topic_reader(guid) {
       if !reader_data
@@ -1700,7 +1720,7 @@ impl Discovery {
 
       #[cfg(feature = "security")]
       let do_nonsecure_write = if let Some(security) = self.security_opt.as_ref() {
-        security.write_single_reader_info(
+        security.sedp_publish_single_reader(
           &self.dcps_subscription.writer,
           &self.dcps_subscriptions_secure.writer,
           reader_data,
@@ -1739,7 +1759,7 @@ impl Discovery {
     }
   }
 
-  pub fn write_readers_info(&self) {
+  pub fn sedp_publish_readers(&self) {
     let db = discovery_db_read(&self.discovery_db);
     let local_user_reader_guids = db
       .get_all_local_topic_readers()
@@ -1753,11 +1773,11 @@ impl Discovery {
       .map(|drd| drd.reader_proxy.remote_reader_guid);
 
     for guid in local_user_reader_guids {
-      self.write_single_reader_info(guid);
+      self.sedp_publish_single_reader(guid);
     }
   }
 
-  pub fn write_single_writer_info(&self, guid: GUID) {
+  pub fn sedp_publish_single_writer(&self, guid: GUID) {
     let db = discovery_db_read(&self.discovery_db);
     if let Some(writer_data) = db.get_local_topic_writer(guid) {
       if !writer_data
@@ -1776,7 +1796,7 @@ impl Discovery {
 
       #[cfg(feature = "security")]
       let do_nonsecure_write = if let Some(security) = self.security_opt.as_ref() {
-        security.write_single_writer_info(
+        security.sedp_publish_single_writer(
           &self.dcps_publication.writer,
           &self.dcps_publications_secure.writer,
           writer_data,
@@ -1814,7 +1834,7 @@ impl Discovery {
     }
   }
 
-  pub fn write_writers_info(&self) {
+  pub fn sedp_publish_writers(&self) {
     let db: std::sync::RwLockReadGuard<'_, DiscoveryDB> = discovery_db_read(&self.discovery_db);
     let local_user_writer_guids = db
       .get_all_local_topic_writers()
@@ -1828,11 +1848,11 @@ impl Discovery {
       .map(|drd| drd.writer_proxy.remote_writer_guid);
 
     for guid in local_user_writer_guids {
-      self.write_single_writer_info(guid);
+      self.sedp_publish_single_writer(guid);
     }
   }
 
-  pub fn write_topic_info(&self, topic_name: &str) {
+  pub fn sedp_publish_topic(&self, topic_name: &str) {
     let db = discovery_db_read(&self.discovery_db);
     // We might have multiple topics with the same name (but different Qos etc..),
     // and the following call gets just one of them. Should we publish all of
@@ -1937,9 +1957,9 @@ impl Discovery {
       .build()
   }
 
-  // This is (partially) gven in DDS Spec v1.4 Section 8.5.3.3.1 SPDPbuiltinParticipantWriter
-  // Table 8.79 - Attributes of the RTPS StatelessWriter used by the SPDP
-  // at least that is is BestEffort.
+  // This is (partially) gven in DDS Spec v1.4 Section 8.5.3.3.1
+  // SPDPbuiltinParticipantWriter Table 8.79 - Attributes of the RTPS
+  // StatelessWriter used by the SPDP at least that is is BestEffort.
   pub fn create_spdp_participant_qos() -> QosPolicies {
     QosPolicyBuilder::new()
       .reliability(Reliability::BestEffort)

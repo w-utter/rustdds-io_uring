@@ -845,7 +845,7 @@ impl SecureDiscovery {
     }
   }
 
-  pub fn send_secure_participant_info(
+  pub fn secure_spdp_publish(
     &self,
     secure_participant_writer: &DataWriterPlCdr<ParticipantBuiltinTopicDataSecure>,
     participant_data: SpdpDiscoveredParticipantData,
@@ -860,7 +860,7 @@ impl SecureDiscovery {
     }
   }
 
-  pub fn write_single_reader_info(
+  pub fn sedp_publish_single_reader(
     &self,
     nonsecure_sub_writer: &DataWriterPlCdr<DiscoveredReaderData>,
     secure_sub_writer: &DataWriterPlCdr<SubscriptionBuiltinTopicDataSecure>,
@@ -906,7 +906,7 @@ impl SecureDiscovery {
     }
   }
 
-  pub fn write_single_writer_info(
+  pub fn sedp_publish_single_writer(
     &self,
     nonsecure_pub_writer: &DataWriterPlCdr<DiscoveredWriterData>,
     secure_pub_writer: &DataWriterPlCdr<PublicationBuiltinTopicDataSecure>,
