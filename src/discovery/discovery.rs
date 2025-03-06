@@ -31,7 +31,7 @@ use crate::{
     },
     spdp_participant_data::{Participant_GUID, SpdpDiscoveredParticipantData},
   },
-  polling::new_simple_timer,
+  polling::{new_simple_timer, TimerPolicy},
   rtps::constant::*,
   serialization::{pl_cdr_adapters::*, CDRDeserializerAdapter, CDRSerializerAdapter},
   structure::{
@@ -135,7 +135,9 @@ mod with_key {
   use mio_extras::timer::Timer;
 
   use super::{DataReaderPlCdr, DataWriterPlCdr};
-  use crate::{serialization::pl_cdr_adapters::*, Key, Keyed, Topic, TopicKind};
+  use crate::{
+    polling::TimerPolicy, serialization::pl_cdr_adapters::*, Key, Keyed, Topic, TopicKind,
+  };
 
   pub const TOPIC_KIND: TopicKind = TopicKind::WithKey;
 
@@ -148,7 +150,7 @@ mod with_key {
     pub topic: Topic,
     pub reader: DataReaderPlCdr<D>,
     pub writer: DataWriterPlCdr<D>,
-    pub timer: Timer<()>,
+    pub timer: Timer<TimerPolicy>,
   }
 
   pub(super) struct DiscoveryTopicCDR<D>
@@ -160,7 +162,7 @@ mod with_key {
     pub topic: Topic,
     pub reader: crate::with_key::DataReaderCdr<D>,
     pub writer: crate::with_key::DataWriterCdr<D>,
-    pub timer: Timer<()>,
+    pub timer: Timer<TimerPolicy>,
   }
 }
 
@@ -169,7 +171,7 @@ mod no_key {
   use serde::{de::DeserializeOwned, Serialize};
   use mio_extras::timer::Timer;
 
-  use crate::{Topic, TopicKind};
+  use crate::{polling::TimerPolicy, Topic, TopicKind};
 
   pub const TOPIC_KIND: TopicKind = TopicKind::NoKey;
 
@@ -182,7 +184,7 @@ mod no_key {
     pub reader: crate::no_key::DataReader<D, crate::CDRDeserializerAdapter<D>>,
     pub writer: crate::no_key::DataWriter<D, crate::CDRSerializerAdapter<D>>,
     #[allow(dead_code)] // Timers currently not used for no_key discovery topics
-    pub timer: Timer<()>,
+    pub timer: Timer<TimerPolicy>,
   }
 }
 
@@ -278,7 +280,7 @@ pub(crate) struct Discovery {
 impl Discovery {
   const PARTICIPANT_CLEANUP_PERIOD: StdDuration = StdDuration::from_secs(2);
   const TOPIC_CLEANUP_PERIOD: StdDuration = StdDuration::from_secs(60); // timer for cleaning up inactive topics
-  const SEND_PARTICIPANT_INFO_PERIOD: StdDuration = StdDuration::from_secs(2);
+  const SPDP_PUBLISH_PERIOD: StdDuration = StdDuration::from_secs(10);
   const CHECK_PARTICIPANT_MESSAGES: StdDuration = StdDuration::from_secs(1);
   #[cfg(feature = "security")]
   const CACHED_SECURE_DISCOVERY_MESSAGE_RESEND_PERIOD: StdDuration = StdDuration::from_secs(1);
@@ -348,6 +350,7 @@ impl Discovery {
       "Unable to create Discovery Publisher."
     );
 
+    // TODO: timeout value is not used. Remove.
     macro_rules! construct_topic_and_poll {
       ( $repr:ident, $has_key:ident,
         $topic_name:expr, $topic_type_name:expr, $message_type:ty,
@@ -401,9 +404,11 @@ impl Discovery {
           .register(&reader, $reader_token, Ready::readable(), PollOpt::edge())
           .expect("Failed to register a discovery reader to poll.");
 
-        let mut timer: Timer<()> = new_simple_timer();
-        if let Some((timeout_value, timer_token)) = $timeout_and_timer_token_opt {
-          timer.set_timeout(timeout_value, ());
+        let mut timer: Timer<TimerPolicy> = new_simple_timer();
+        let timeout_and_timer_token_opt: Option<(StdDuration, mio_06::Token)> =
+          $timeout_and_timer_token_opt;
+        if let Some((_timeout_value, timer_token)) = timeout_and_timer_token_opt {
+          timer.set_timeout(StdDuration::from_millis(100), TimerPolicy::Repeat);
           poll
             .register(&timer, timer_token, Ready::readable(), PollOpt::edge())
             .expect("Unable to register timer token. ");
@@ -445,7 +450,7 @@ impl Discovery {
       DISCOVERY_PARTICIPANT_DATA_TOKEN,
       EntityId::SPDP_BUILTIN_PARTICIPANT_WRITER,
       Some((
-        Self::SEND_PARTICIPANT_INFO_PERIOD,
+        Self::SPDP_PUBLISH_PERIOD,
         DISCOVERY_SEND_PARTICIPANT_INFO_TOKEN,
       )),
     );
@@ -843,10 +848,19 @@ impl Discovery {
               return;
             };
             // reschedule timer
-            self
-              .dcps_participant
-              .timer
-              .set_timeout(Self::SEND_PARTICIPANT_INFO_PERIOD, ());
+            while let Some(policy) = self.dcps_participant.timer.poll() {
+              match policy {
+                TimerPolicy::Repeat => {
+                  self
+                    .dcps_participant
+                    .timer
+                    .set_timeout(Self::SPDP_PUBLISH_PERIOD, TimerPolicy::Repeat);
+                }
+                TimerPolicy::OneShot => {
+                  // Do not set again, since it was one-shot.
+                }
+              }
+            }
           }
           DISCOVERY_READER_DATA_TOKEN => {
             self.sedp_receive_subscription(None);
@@ -872,7 +886,7 @@ impl Discovery {
             self
               .dcps_participant_message
               .timer
-              .set_timeout(Self::CHECK_PARTICIPANT_MESSAGES, ());
+              .set_timeout(Self::CHECK_PARTICIPANT_MESSAGES, TimerPolicy::Repeat);
           }
           SPDP_LIVENESS_TOKEN => {
             while let Ok(guid_prefix) = self.spdp_liveness_receiver.try_recv() {
@@ -1001,8 +1015,27 @@ impl Discovery {
     let guid_prefix = participant_data.participant_guid.prefix;
     self.send_discovery_notification(DiscoveryNotificationType::ParticipantUpdated { guid_prefix });
     if was_new {
-      let dpd = participant_data.into();
-      self.send_participant_status(DomainParticipantStatusEvent::ParticipantDiscovered { dpd });
+      // Inform DDS Applications
+      self.send_participant_status(DomainParticipantStatusEvent::ParticipantDiscovered {
+        dpd: participant_data.into(),
+      });
+
+      // Send a quick response to make discovery faster.
+      //
+      // RTPS spec v2.5 Section "8.5.3.1 General Approach" [to SPDP] says
+      // "Implementations can minimize any start-up delays by sending an additional
+      // SPDPdiscoveredParticipantData in response to receiving this data-object from
+      // a previously unknown Participant, but this behavior is optional."
+      //
+      // But not to reply to self, because we know that we exist.
+      // TODO: Maybe add some rate-limiting to this to avoid packet storms.
+      if guid_prefix != self.domain_participant.guid().prefix {
+        self
+          .dcps_participant
+          .timer
+          .set_timeout(StdDuration::from_millis(10), TimerPolicy::OneShot);
+      }
+
       // This may be a rediscovery of a previously seen participant that
       // was temporarily lost due to network outage. Check if we already know
       // what it has (readers, writers, topics).
@@ -1349,7 +1382,7 @@ impl Discovery {
     let data = SpdpDiscoveredParticipantData::from_local_participant(
       local_dp,
       &self.security_opt,
-      5.0 * Duration::from(Self::SEND_PARTICIPANT_INFO_PERIOD),
+      5.0 * Duration::from(Self::SPDP_PUBLISH_PERIOD),
     );
 
     #[cfg(feature = "security")]

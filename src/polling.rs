@@ -10,6 +10,12 @@
 
 use mio_extras::{timer, timer::Timer};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum TimerPolicy {
+  Repeat,
+  OneShot,
+}
+
 // The default timer has 256 timer wheel slots and capacity
 // ("Max number of timeouts that can be in flight at a given time") of 65536.
 // This seems to take up a lot of memory.
