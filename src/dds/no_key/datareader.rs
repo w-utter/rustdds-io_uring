@@ -520,14 +520,10 @@ where
 
 /// WARNING! UNTESTED
 //  TODO: test
-use crate::with_key::SimpleDataReaderEventStream;
+use crate::no_key::SimpleDataReaderEventStream;
 
-impl<'a, D, DA>
-  StatusEvented<
-    'a,
-    DataReaderStatus,
-    SimpleDataReaderEventStream<'a, NoKeyWrapper<D>, DAWrapper<DA>>,
-  > for DataReader<D, DA>
+impl<'a, D, DA> StatusEvented<'a, DataReaderStatus, SimpleDataReaderEventStream<'a, D, DA>>
+  for DataReader<D, DA>
 where
   D: 'static,
   DA: DeserializerAdapter<D>,
@@ -540,10 +536,8 @@ where
     self.keyed_datareader.as_status_source()
   }
 
-  fn as_async_status_stream(
-    &'a self,
-  ) -> SimpleDataReaderEventStream<'a, NoKeyWrapper<D>, DAWrapper<DA>> {
-    self.keyed_datareader.as_async_status_stream()
+  fn as_async_status_stream(&'a self) -> SimpleDataReaderEventStream<'a, D, DA> {
+    SimpleDataReaderEventStream::from_keyed(self.keyed_datareader.as_async_status_stream())
   }
 
   fn try_recv_status(&self) -> Option<DataReaderStatus> {

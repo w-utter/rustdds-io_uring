@@ -1,6 +1,10 @@
-use std::{io, task::Waker};
+use std::{
+  io,
+  pin::Pin,
+  task::{Context, Poll, Waker},
+};
 
-use futures::stream::{FusedStream, StreamExt};
+use futures::stream::{FusedStream, Stream, StreamExt};
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 
@@ -194,14 +198,10 @@ where
   }
 }
 
-use crate::with_key::SimpleDataReaderEventStream;
+//use crate::with_key::SimpleDataReaderEventStream;
 
-impl<'a, D, DA>
-  StatusEvented<
-    'a,
-    DataReaderStatus,
-    SimpleDataReaderEventStream<'a, NoKeyWrapper<D>, DAWrapper<DA>>,
-  > for SimpleDataReader<D, DA>
+impl<'a, D, DA> StatusEvented<'a, DataReaderStatus, SimpleDataReaderEventStream<'a, D, DA>>
+  for SimpleDataReader<D, DA>
 where
   D: 'static,
   DA: DeserializerAdapter<D>,
@@ -214,10 +214,10 @@ where
     self.keyed_simpledatareader.as_status_source()
   }
 
-  fn as_async_status_stream(
-    &'a self,
-  ) -> SimpleDataReaderEventStream<'a, NoKeyWrapper<D>, DAWrapper<DA>> {
-    self.keyed_simpledatareader.as_async_status_stream()
+  fn as_async_status_stream(&'a self) -> SimpleDataReaderEventStream<'a, D, DA> {
+    SimpleDataReaderEventStream {
+      keyed_event_stream: self.keyed_simpledatareader.as_async_status_stream(),
+    }
   }
 
   fn try_recv_status(&self) -> Option<DataReaderStatus> {
@@ -237,3 +237,46 @@ where
 
 // ----------------------------------------------
 // ----------------------------------------------
+
+pub struct SimpleDataReaderEventStream<
+  'a,
+  D: 'static,
+  DA: DeserializerAdapter<D> + 'static = CDRDeserializerAdapter<D>,
+> {
+  keyed_event_stream:
+    crate::with_key::SimpleDataReaderEventStream<'a, NoKeyWrapper<D>, DAWrapper<DA>>,
+}
+
+impl<'a, D, DA> SimpleDataReaderEventStream<'a, D, DA>
+where
+  D: 'static,
+  DA: DeserializerAdapter<D>,
+{
+  pub(crate) fn from_keyed(
+    keyed_event_stream: with_key::SimpleDataReaderEventStream<'a, NoKeyWrapper<D>, DAWrapper<DA>>,
+  ) -> Self {
+    Self { keyed_event_stream }
+  }
+}
+
+impl<D, DA> Stream for SimpleDataReaderEventStream<'_, D, DA>
+where
+  D: 'static,
+  DA: DeserializerAdapter<D>,
+{
+  type Item = DataReaderStatus;
+
+  fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    Pin::new(&mut self.keyed_event_stream).poll_next(cx)
+  }
+} // impl
+
+impl<D, DA> FusedStream for SimpleDataReaderEventStream<'_, D, DA>
+where
+  D: 'static,
+  DA: DeserializerAdapter<D>,
+{
+  fn is_terminated(&self) -> bool {
+    self.keyed_event_stream.is_terminated()
+  }
+}
