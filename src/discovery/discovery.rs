@@ -135,9 +135,7 @@ mod with_key {
   use mio_extras::timer::Timer;
 
   use super::{DataReaderPlCdr, DataWriterPlCdr};
-  use crate::{
-    polling::TimerPolicy, serialization::pl_cdr_adapters::*, Key, Keyed, Topic, TopicKind,
-  };
+  use crate::{polling::TimerPolicy, serialization::pl_cdr_adapters::*, Key, Keyed, Topic, TopicKind};
 
   pub const TOPIC_KIND: TopicKind = TopicKind::WithKey;
 
@@ -2073,7 +2071,10 @@ mod tests {
   #[test]
   fn discovery_participant_data_test() {
     let poll = Poll::new().unwrap();
-    let mut udp_listener = UDPListener::new_unicast("127.0.0.1", 11000).unwrap();
+    const LISTENER_PORT: u16 = spdp_well_known_unicast_port(12, 0);
+
+    let mut udp_listener =
+      UDPListener::new_unicast("127.0.0.1", LISTENER_PORT).expect("udp listener creation");
     poll
       .register(
         udp_listener.mio_socket(),
@@ -2085,10 +2086,7 @@ mod tests {
 
     // sending participant data to discovery
     let udp_sender = UDPSender::new_with_random_port().expect("failed to create UDPSender");
-    let addresses = vec![SocketAddr::new(
-      "127.0.0.1".parse().unwrap(),
-      spdp_well_known_unicast_port(0, 0),
-    )];
+    let addresses = vec![SocketAddr::new("127.0.0.1".parse().unwrap(), LISTENER_PORT)];
 
     let tdata = spdp_participant_msg_mod(11000);
     let msg_data = tdata
@@ -2137,8 +2135,10 @@ mod tests {
     let _reader =
       subscriber.create_datareader::<ShapeType, CDRDeserializerAdapter<ShapeType>>(&topic, None);
 
-    let poll = Poll::new().unwrap();
-    let mut udp_listener = UDPListener::new_unicast("127.0.0.1", 11001).unwrap();
+    let poll: Poll = Poll::new().unwrap();
+    const LISTENER_PORT: u16 = spdp_well_known_unicast_port(14, 0);
+
+    let mut udp_listener = UDPListener::new_unicast("127.0.0.1", LISTENER_PORT).unwrap();
     poll
       .register(
         udp_listener.mio_socket(),
@@ -2148,14 +2148,13 @@ mod tests {
       )
       .unwrap();
 
-    let udp_sender = UDPSender::new_with_random_port().expect("failed to create UDPSender");
-    let addresses = vec![SocketAddr::new(
-      "127.0.0.1".parse().unwrap(),
-      spdp_well_known_unicast_port(14, 0),
-    )];
+    let udp_sender: UDPSender =
+      UDPSender::new_with_random_port().expect("failed to create UDPSender");
+    let addresses: Vec<SocketAddr> =
+      vec![SocketAddr::new("127.0.0.1".parse().unwrap(), LISTENER_PORT)];
 
-    let mut tdata = spdp_subscription_msg();
-    let mut data;
+    let mut tdata: crate::rtps::Message = spdp_subscription_msg();
+    let mut data: bytes::Bytes;
     for submsg in &mut tdata.submessages {
       match &mut submsg.body {
         SubmessageBody::Writer(WriterSubmessage::Data(d, _)) => {
@@ -2184,18 +2183,18 @@ mod tests {
       }
     }
 
-    let msg_data = tdata
+    let msg_data: Vec<u8> = tdata
       .write_to_vec_with_ctx(Endianness::LittleEndian)
       .expect("Failed to write msg data");
 
     udp_sender.send_to_all(&msg_data, &addresses);
 
-    let mut events = Events::with_capacity(10);
+    let mut events: Events = Events::with_capacity(10);
     poll
       .poll(&mut events, Some(StdDuration::from_secs(1)))
       .unwrap();
 
-    let _data2 = udp_listener.get_message();
+    let _data2: Vec<u8> = udp_listener.get_message();
   }
 
   #[test]
