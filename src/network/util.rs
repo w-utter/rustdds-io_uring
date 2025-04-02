@@ -3,9 +3,8 @@ use std::{
   net::{IpAddr, SocketAddr},
 };
 
-use if_addrs::Interface;
-#[allow(unused_imports)]
-use log::{debug, error, info, trace};
+use log::error;
+use pnet::datalink::NetworkInterface;
 
 use crate::structure::locator::Locator;
 
@@ -31,19 +30,28 @@ pub fn get_local_unicast_locators(port: u16) -> Vec<Locator> {
   }
 }
 
-// Enumerates local ip interfaces that we use for multicasting.
-// This is used to set up senders and listeners.
-//
-// TODO: Check that the interface actually has multicast enabled.
-// Now we just skip loopback.
-// Could use e.g. "interfaces" crate to do this.
+/// Enumerates local interfaces that we may use for multicasting.
+///
+/// The result of this function is used to set up senders and listeners.
 pub fn get_local_multicast_ip_addrs() -> io::Result<Vec<IpAddr>> {
-  let ifs = if_addrs::get_if_addrs()?;
-  Ok(
-    ifs
-      .iter()
-      .filter(|ifaddr| !ifaddr.is_loopback())
-      .map(Interface::ip)
-      .collect(),
-  )
+  // grab a list of system intefaces.
+  //
+  // note: `pnet` works on mac, windows, and linux, potentially alongside
+  // other systems.
+  let interfaces = pnet::datalink::interfaces();
+
+  // grab all the ips from each interface
+  Ok(get_local_multicast_ip_addrs_inner(interfaces))
+}
+
+/// Inner implementation of [`get_local_multicast_ip_addrs`], for testing purposes.
+fn get_local_multicast_ip_addrs_inner(interfaces: Vec<NetworkInterface>) -> Vec<IpAddr> {
+  interfaces
+    .into_iter()
+    .filter(|ifaddr| !ifaddr.is_loopback()) // don't use lo interface
+    .filter(|ifaddr| ifaddr.is_multicast()) // require support for multicast
+    .flat_map(|ifaddr| ifaddr.ips)
+    .map(|ip_net| ip_net.ip()) // get the ip from each ip network
+    .filter(|ip| ip.is_ipv4()) // use ipv4 only :(
+    .collect::<Vec<_>>()
 }
