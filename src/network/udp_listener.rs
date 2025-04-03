@@ -132,7 +132,15 @@ impl UDPListener {
               e, multicast_group, a
             );
           }),
-        IpAddr::V6(_a) => error!("UDPListener::new_multicast() not implemented for IpV6"), // TODO
+
+        IpAddr::V6(addr) => {
+          if let Err(e) = mio_socket.join_multicast_v6(&addr, 0) {
+            warn!(
+              "join_multicast_v6 failed. err: {e}. mcast group: [{multicast_group:?}], \
+               addr:[{addr:?}]"
+            );
+          }
+        }
       }
     }
 
@@ -159,18 +167,31 @@ impl UDPListener {
   // We cannot read a single packet only, because we use edge-triggered polls.
   #[cfg(test)]
   pub fn get_message(&self) -> Vec<u8> {
-    let mut message: Vec<u8> = vec![];
     let mut buf: [u8; MAX_MESSAGE_SIZE] = [0; MAX_MESSAGE_SIZE];
-    match self.socket.recv(&mut buf) {
-      Ok(nbytes) => {
-        message = buf[..nbytes].to_vec();
-        return message;
+
+    // try getting the message several times
+    for _ in 0..10 {
+      match self.socket.recv(&mut buf) {
+        Ok(nbytes) => {
+          assert!(nbytes > 0, "tests should always read data");
+
+          return buf[..nbytes].to_vec();
+        }
+        Err(e) => {
+          // handle EAGAIN on UNIX platforms.
+          //
+          // this means we need to wait for the kernel to give us the data.
+          if e.kind() == io::ErrorKind::WouldBlock {
+            std::thread::sleep(core::time::Duration::from_millis(50));
+            continue;
+          }
+
+          panic!("test helper (`get_message`) failed! err: {e}");
+        }
       }
-      Err(e) => {
-        debug!("UDPListener::get_message failed: {e:?}");
-      }
-    };
-    message
+    }
+
+    panic!("test helper didn't recv message after ten attempts.");
   }
 
   /// Get all messages waiting in the socket.

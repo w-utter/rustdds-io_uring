@@ -1,6 +1,6 @@
 use std::{
   io,
-  net::{IpAddr, SocketAddr},
+  net::{IpAddr, SocketAddr, UdpSocket},
 };
 #[cfg(test)]
 use std::net::Ipv4Addr;
@@ -38,27 +38,54 @@ impl UDPSender {
 
     let mut multicast_sockets = Vec::with_capacity(1);
     for multicast_if_ipaddr in get_local_multicast_ip_addrs()? {
-      let raw_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
       // beef: specify output interface
-      info!(
+      trace!(
         "UDPSender: Multicast sender on interface {:?}",
         multicast_if_ipaddr
       );
-      match multicast_if_ipaddr {
+
+      let mc_socket = match multicast_if_ipaddr {
+        // ipv4 requires a little more work
         IpAddr::V4(a) => {
+          let raw_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
           raw_socket.set_multicast_if_v4(&a)?;
+
+          // Handle windows.
+          //
+          // TODO: Check if necessary.
           if cfg!(windows) {
             raw_socket.set_reuse_address(true)?;
-          } // Necessary? TODO: Check if necessary.
-          raw_socket.bind(&SockAddr::from(SocketAddr::new(multicast_if_ipaddr, 0)))?;
-        }
-        IpAddr::V6(_a) => error!("UDPSender::new() not implemented for IpV6"), // TODO
-      }
+          }
 
-      let mc_socket = std::net::UdpSocket::from(raw_socket);
-      mc_socket.set_multicast_loop_v4(true).unwrap_or_else(|e| {
-        error!("Cannot set multicast loop on: {e:?}");
-      });
+          // bind to the multicast interface
+          raw_socket.bind(&SockAddr::from(SocketAddr::new(multicast_if_ipaddr, 0)))?;
+
+          // make multicast sock
+          let mc_socket = UdpSocket::from(raw_socket);
+          mc_socket.set_multicast_loop_v4(true).unwrap_or_else(|e| {
+            error!("Cannot set IPv4 multicast loop. err: {e}");
+          });
+          mc_socket
+        }
+
+        // ipv6
+        IpAddr::V6(addr) => {
+          let raw_socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+
+          // note: you don't need to use set_multicast_if for ipv6 multicast.
+          // it comes for free!
+          raw_socket.bind(&SocketAddr::new(addr.into(), 0).into())?;
+
+          // make multicast sock
+          let mc_socket = UdpSocket::from(raw_socket);
+          mc_socket.set_multicast_loop_v6(true).unwrap_or_else(|e| {
+            error!("Cannot set IPv6 multicast loop. err: {e}");
+          });
+
+          mc_socket
+        }
+      };
+
       multicast_sockets.push(mio_08::net::UdpSocket::from_std(mc_socket));
     } // end for
 
@@ -135,10 +162,23 @@ impl UDPSender {
 
   #[cfg(test)]
   pub fn send_to_all(&self, buffer: &[u8], addresses: &[SocketAddr]) {
+    let buf_len = buffer.len();
+
     for address in addresses.iter() {
-      if self.unicast_socket.send_to(buffer, *address).is_err() {
-        debug!("Unable to send to {}", address);
-      };
+      // try sending the addr a message
+      match self.unicast_socket.send_to(buffer, *address) {
+        Ok(bytes_sent) => {
+          // error if we didn't send the whole buffer.
+          if bytes_sent != buffer.len() {
+            panic!("tried to send `{buf_len}` bytes, sent only `{bytes_sent}`!");
+          }
+        }
+
+        // it's a problem if we couldn't send anything - so we'll panic!
+        Err(e) => {
+          panic!("Unable to send to `{address}`. err: {e}");
+        }
+      }
     }
   }
 
@@ -162,7 +202,6 @@ impl UDPSender {
 
 #[cfg(test)]
 mod tests {
-
   use super::*;
   use crate::network::udp_listener::*;
 
