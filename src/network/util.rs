@@ -44,7 +44,8 @@ pub fn get_local_multicast_ip_addrs() -> io::Result<Vec<IpAddr>> {
   Ok(get_local_multicast_ip_addrs_inner(interfaces))
 }
 
-/// Inner implementation of [`get_local_multicast_ip_addrs`], for testing purposes.
+/// Inner implementation of [`get_local_multicast_ip_addrs`], for testing
+/// purposes.
 fn get_local_multicast_ip_addrs_inner(interfaces: Vec<NetworkInterface>) -> Vec<IpAddr> {
   interfaces
     .into_iter()
@@ -93,7 +94,8 @@ mod tests {
     assert!(ips.contains(&Ipv4Addr::new(192, 168, 0, 137).into()));
 
     // TODO: uncomment if ipv6
-    // assert!(ips.contains(&Ipv6Addr::new(0xfd73, 0x40a2, 0x1c3e, 0, 0, 0, 0, 0).into()))
+    // assert!(ips.contains(&Ipv6Addr::new(0xfd73, 0x40a2, 0x1c3e, 0, 0, 0, 0,
+    // 0).into()))
   }
 
   /// Tries a number of interfaces, none of which support multicast.

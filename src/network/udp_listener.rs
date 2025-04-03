@@ -136,7 +136,8 @@ impl UDPListener {
         IpAddr::V6(addr) => {
           if let Err(e) = mio_socket.join_multicast_v6(&addr, 0) {
             warn!(
-              "join_multicast_v6 failed. err: {e}. mcast group: [{multicast_group:?}], addr:[{addr:?}]"
+              "join_multicast_v6 failed. err: {e}. mcast group: [{multicast_group:?}], \
+               addr:[{addr:?}]"
             );
           }
         }
