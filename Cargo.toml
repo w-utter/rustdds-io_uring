@@ -100,7 +100,7 @@ hex-literal = "1.0"
 anyhow = "1.0" # for test cases
 
 # ros_visualizer
-crossterm = "0.28"
+crossterm = "0.29"
 tui = { version = "0.19", default-features = false, features = ['crossterm'] }
 
 # shapes-demo
