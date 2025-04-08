@@ -107,7 +107,7 @@ mod tests {
 
     for index in 0..10 {
       interfaces.push(interface(
-        &format!("eth{}", index),
+        format!("eth{}", index),
         index,
         &[IpNetwork::V4(
           Ipv4Network::new(Ipv4Addr::new(192, 168, 0, rand::random()), 24).unwrap(),

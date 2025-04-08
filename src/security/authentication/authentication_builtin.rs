@@ -29,6 +29,7 @@ pub(in crate::security) mod types;
 // started, it doesn't terminate if some step fails. Instead, it just doesn't
 // advance to the next step.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // These are only used during handshake
 pub(crate) enum BuiltinHandshakeState {
   PendingRequestSend,    // We need to create & send the handshake request
   PendingRequestMessage, // We are waiting for a handshake request from remote participant

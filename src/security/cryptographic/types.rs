@@ -94,10 +94,14 @@ impl fmt::Display for CryptoTransformKeyId {
 /// may return the unencoded input or an encoded message between a
 /// `SecurePrefix` and `SecurePostfix`. See 7.3.6.4.4 and 8.5.1.9.2 in DDS
 /// Security v1.1.
+#[allow(clippy::large_enum_variant)]
 pub enum EncodedSubmessage {
   Unencoded(Submessage),
   Encoded(Submessage, Submessage, Submessage),
 }
+// 2025-04-08: Latest clippy warns about too unequal variant sizes
+// (large_enum_variant). TODO: Improve the situation by making submessage
+// handling more pointer-based, e.g. use Box, Arc, or similar to reduce copying.
 
 impl From<EncodedSubmessage> for Vec<Submessage> {
   fn from(value: EncodedSubmessage) -> Self {

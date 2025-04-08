@@ -22,106 +22,6 @@ Currently, the implementation is complete enough to do data exchange with [ROS2]
 
 The [ros2-client](https://crates.io/crates/ros2-client) is recommended for talking to ROS components. The `ros2` module within RustDDS should not be used anymore.
 
-## Version 0.11.0
-* `DataReaderStream` sample stream now returns full `DataSample`, including sample metadata 
-(`SampleInfo`). The old version returned only bare data value. You can access the old (simpler and faster) async stream as `BareDataReaderStream`.
-
-### Version 0.11.1
-* Improve interoperability in DDS-RPC. Inline QoS parameter `RELATED_SAMPLE_IDENTITY` apparently has two encodings in practical use. Fixes interoperability with new eProsima FastDDS versions.
-
-### Version 0.11.2
-* Fix possible panic if system clock jumps backward.
-* Fix Writer history garbage collection.
-
-### Version 0.11.3
-* Fix bug revealed by improvements in 0.11.2
-
-### Version 0.11.4
-* Faster response to SPDP (Discovery) Announcements. Makes connection forming faster.
-* Update dependency versions
-
-## Version 0.10.0
-The `DeserializerAdpter` interface for attaching serialization formats to RTPS was extended
-to support deserialization with a "seed" value. This allows the deserialization process
-to input other run-time data besides the incoming byte stream.
-
-### 0.10.1
-* Make RTPS Timestamp's native tick count publicly accessible
-
-### 0.10.2
-* Bug fix: Reliable DataReader delivered data samples in the wrong order, if they have arrived out-of-order.
-* Change socket initialization behaviour on Windows.
-* [CDR serialization](https://crates.io/crates/cdr-encoding) is now a separate Rust crate.
-
-### 0.10.3
-* Bug fixes to improve interoperability with CycloneDDS
-* Two example programs to test against CycloneDDS examples
-
-## Version 0.9.2
-* Redesign internal caching to resolve bugs in connecting.
-
-## Version 0.9.1
-* Numerous bug fixes
-  * Memory leak in DDSCache
-  * Reliable receiver could get stuck
-* DDS Security interoperability with FastDDS improved
-* New security features, e.g. PKCS#11 support, RSA authentication support
-
-## Version 0.9
-* New release to enable new features in `ros2-client`
-* DDS Security is under interoperability testing.
-* Support for DomainParticipnnt status events, mostly Discovery-related.
-* Small API changes
-  * Simplify naming
-  * QoS objects are now serializable
-* Protocol bug fixes with Realible connections.
-
-## Version 0.8.6
-
-* Feature `security` is nearing completion. RustDDS can securely talk to itself, but interoperability testing against other DDS implementaitons is still in progress.
-* Fix several bugs in SequenceNumber handling.
-* RTPS Writer data sending rewritten.
-* Fixed bug: Source timestamps were missing on retransmitted data.
-
-
-## Version 0.8.5
-
-* Feature `security` merged to master, but it is still work-in-progress, so does not work yet.
-* Should work on Windows again
-* Less strict lifetime bound in deserialization
-* Simplify Key trait usage
-
-## Version 0.8
-
-New features:
-
-* Async API is available.
-* Polling using either mio-0.6 or mio-0.8.
-* Simplified DataReader `SimpleDataReader` is available. It supports only `.take()` calls, but
-should be lighter and faster than regular DataReader. It is designed to have just enough
-functionality to implement a ROS2 Subscriber.
-
-This release breaks compatibility:
-
-* Naming of data returned from `read()` / `.take()` calls has been changed from `Result` to 
-`Sample`. This was done to reduce confusing naming, because in the previous usage the `Err`
- variant of `Result` did not mean an actual error condition, but a data instance disposal 
- operation.
-* Error types are reworked to better reflect what errors can actually result, rather than having
- one complex error type for the entire API. This is an intentional deviation from the DDS
- Specification to make the implementation more Rust-like.
-
-
-## Version 0.6
-
-This release breaks compatibility with 0.5.x. There are some minor differences in public API names. Changes were made to follow Rust naming conventions. Version 0.6.0 fixes a regression, where communication with eProsima FastRTPS was only possible for a short time.
-
-## Version 0.5
-
-This release breaks compatibility with 0.4.0. Differences are
-* Naming convention is more Rust-like, instead of DDS convention - mostly capitalization and underscores.
-* Some functions new require owned `String` instead of `&str`. Just add `.to_string()` to fix.
-* Key size detection (is it over 16 bytes?) is now implemented in a trait with derive macro.
 
 ## Features Status
 
@@ -240,6 +140,113 @@ In addition to these, we also provide a Rust Iterator interface for reading data
 
 The DDS specification specifies manual memory management in the sense that many object types are created with a 
 `create_` method call and destroyed with a matching `delete_` method call. We have opted to rely on Rust memory management wherever possible, including handling of payload data.
+
+# Release history
+
+## Version 0.11.0
+* `DataReaderStream` sample stream now returns full `DataSample`, including sample metadata 
+(`SampleInfo`). The old version returned only bare data value. You can access the old (simpler and faster) async stream as `BareDataReaderStream`.
+
+### Version 0.11.1
+* Improve interoperability in DDS-RPC. Inline QoS parameter `RELATED_SAMPLE_IDENTITY` apparently has two encodings in practical use. Fixes interoperability with new eProsima FastDDS versions.
+
+### Version 0.11.2
+* Fix possible panic if system clock jumps backward.
+* Fix Writer history garbage collection.
+
+### Version 0.11.3
+* Fix bug revealed by improvements in 0.11.2
+
+### Version 0.11.4
+* Faster response to SPDP (Discovery) Announcements. Makes connection forming faster.
+* Update dependency versions
+
+### Version 0.11.5
+* Fix private type leak, which prevented NO_KEY topics working with mio-0.8.x. Discovered by @garamgim.
+* Properly check for multicast when enumerating network interfaces. Fix contributed by @onkoe.
+
+## Version 0.10.0
+The `DeserializerAdpter` interface for attaching serialization formats to RTPS was extended
+to support deserialization with a "seed" value. This allows the deserialization process
+to input other run-time data besides the incoming byte stream.
+
+### 0.10.1
+* Make RTPS Timestamp's native tick count publicly accessible
+
+### 0.10.2
+* Bug fix: Reliable DataReader delivered data samples in the wrong order, if they have arrived out-of-order.
+* Change socket initialization behaviour on Windows.
+* [CDR serialization](https://crates.io/crates/cdr-encoding) is now a separate Rust crate.
+
+### 0.10.3
+* Bug fixes to improve interoperability with CycloneDDS
+* Two example programs to test against CycloneDDS examples
+
+## Version 0.9.2
+* Redesign internal caching to resolve bugs in connecting.
+
+## Version 0.9.1
+* Numerous bug fixes
+  * Memory leak in DDSCache
+  * Reliable receiver could get stuck
+* DDS Security interoperability with FastDDS improved
+* New security features, e.g. PKCS#11 support, RSA authentication support
+
+## Version 0.9
+* New release to enable new features in `ros2-client`
+* DDS Security is under interoperability testing.
+* Support for DomainParticipnnt status events, mostly Discovery-related.
+* Small API changes
+  * Simplify naming
+  * QoS objects are now serializable
+* Protocol bug fixes with Realible connections.
+
+## Version 0.8.6
+
+* Feature `security` is nearing completion. RustDDS can securely talk to itself, but interoperability testing against other DDS implementaitons is still in progress.
+* Fix several bugs in SequenceNumber handling.
+* RTPS Writer data sending rewritten.
+* Fixed bug: Source timestamps were missing on retransmitted data.
+
+
+## Version 0.8.5
+
+* Feature `security` merged to master, but it is still work-in-progress, so does not work yet.
+* Should work on Windows again
+* Less strict lifetime bound in deserialization
+* Simplify Key trait usage
+
+## Version 0.8
+
+New features:
+
+* Async API is available.
+* Polling using either mio-0.6 or mio-0.8.
+* Simplified DataReader `SimpleDataReader` is available. It supports only `.take()` calls, but
+should be lighter and faster than regular DataReader. It is designed to have just enough
+functionality to implement a ROS2 Subscriber.
+
+This release breaks compatibility:
+
+* Naming of data returned from `read()` / `.take()` calls has been changed from `Result` to 
+`Sample`. This was done to reduce confusing naming, because in the previous usage the `Err`
+ variant of `Result` did not mean an actual error condition, but a data instance disposal 
+ operation.
+* Error types are reworked to better reflect what errors can actually result, rather than having
+ one complex error type for the entire API. This is an intentional deviation from the DDS
+ Specification to make the implementation more Rust-like.
+
+
+## Version 0.6
+
+This release breaks compatibility with 0.5.x. There are some minor differences in public API names. Changes were made to follow Rust naming conventions. Version 0.6.0 fixes a regression, where communication with eProsima FastRTPS was only possible for a short time.
+
+## Version 0.5
+
+This release breaks compatibility with 0.4.0. Differences are
+* Naming convention is more Rust-like, instead of DDS convention - mostly capitalization and underscores.
+* Some functions new require owned `String` instead of `&str`. Just add `.to_string()` to fix.
+* Key size detection (is it over 16 bytes?) is now implemented in a trait with derive macro.
 
 
 # Based on rtps-rs
