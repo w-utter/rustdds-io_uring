@@ -93,7 +93,7 @@ impl UDPListener<buf_ring_state::Uninit> {
         })
     }
 
-    fn register(mut self, ring: &mut io_uring::IoUring, buf_id: &mut u16, udata: u64) -> std::io::Result<UDPListener<buf_ring_state::Init>> {
+    pub fn register(mut self, ring: &mut io_uring::IoUring, buf_id: &mut u16, udata: u64) -> std::io::Result<UDPListener<buf_ring_state::Init>> {
         use core::ptr;
         // SAFETY: were never using `self` here again
         let socket = unsafe { ptr::read(&self.socket) };

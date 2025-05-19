@@ -198,6 +198,8 @@ pub mod ros2;
 /// Helpers for (De)serialization and definitions of (De)serializer adapters
 pub mod serialization;
 
+mod io_uring;
+
 // Re-exports from crate root to simplify usage
 #[doc(inline)]
 pub use dds::{

@@ -85,6 +85,8 @@ cryptoki = { version = "0.9", optional = true }
 pnet = { version = "0.35.0", default-features = false, features = ["std", "pnet_datalink"] }
 pnet_sys = { version = "0.35.0", default-features = false }
 
+io-uring = "0.7.6"
+io-uring-buf-ring = {git = "https://github.com/w-utter/io-uring-buf-ring"}
 
 [target.'cfg(windows)'.dependencies]
 local-ip-address = "0.6.1"
