@@ -127,4 +127,3 @@ impl UdpListeners<buf_ring_state::Uninit> {
         })
     }
 }
-
