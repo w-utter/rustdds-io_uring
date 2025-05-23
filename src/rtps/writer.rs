@@ -119,7 +119,7 @@ impl AckWaiter {
 }
 
 // helper struct for Writer
-struct HistoryBuffer {
+pub(crate) struct HistoryBuffer {
   first_seq: SequenceNumber, // oldest not removed. Default is 1.
   last_seq: SequenceNumber,  // latest added. Default is 0.
 
@@ -137,7 +137,7 @@ struct HistoryBuffer {
 }
 
 impl HistoryBuffer {
-  fn new(topic_name: String) -> Self {
+  pub(crate) fn new(topic_name: String) -> Self {
     HistoryBuffer {
       first_seq: SequenceNumber::new(1),
       last_seq: SequenceNumber::new(0), // Indicates that we have nothing yet
@@ -150,7 +150,7 @@ impl HistoryBuffer {
   /// Internal counter used to assign
   /// increasing sequence number to
   /// each change made by the Writer
-  fn last_change_sequence_number(&self) -> SequenceNumber {
+  pub(crate) fn last_change_sequence_number(&self) -> SequenceNumber {
     self.last_seq
   }
 
@@ -158,22 +158,22 @@ impl HistoryBuffer {
   /// sequence number that is available in the Writer.
   /// If no samples are available in the Writer, identifies the lowest
   /// sequence number that is yet to be written by the Writer
-  fn first_change_sequence_number(&self) -> SequenceNumber {
+  pub(crate) fn first_change_sequence_number(&self) -> SequenceNumber {
     self.first_seq
   }
 
-  fn get_change(&self, ts: Timestamp) -> Option<&CacheChange> {
+  pub(crate) fn get_change(&self, ts: Timestamp) -> Option<&CacheChange> {
     self.history_buffer.get(&ts)
   }
 
-  fn get_by_sn(&self, sn: SequenceNumber) -> Option<&CacheChange> {
+  pub(crate) fn get_by_sn(&self, sn: SequenceNumber) -> Option<&CacheChange> {
     self
       .sequence_number_to_instant
       .get(&sn)
       .and_then(|ts| self.get_change(*ts))
   }
 
-  fn add_change(&mut self, timestamp: Timestamp, new_cache_change: CacheChange) {
+  pub(crate) fn add_change(&mut self, timestamp: Timestamp, new_cache_change: CacheChange) {
     let new_seq = new_cache_change.sequence_number;
 
     // actual insert
@@ -194,7 +194,7 @@ impl HistoryBuffer {
     }
   }
 
-  fn remove_changes_before(&mut self, remove_before_seq: SequenceNumber) {
+  pub(crate) fn remove_changes_before(&mut self, remove_before_seq: SequenceNumber) {
     if let Some(remove_before) = self.sequence_number_to_instant.get(&remove_before_seq) {
       let count_before = self.history_buffer.len();
       self.history_buffer = self.history_buffer.split_off(remove_before);

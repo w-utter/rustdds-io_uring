@@ -353,6 +353,10 @@ impl EntityId {
   fn as_usize(self) -> usize {
     // usize is generated like this because there needs to be
     // a way to tell entity kind from the result
+    self.as_u32() as usize
+  }
+
+  pub(crate) fn as_u32(self) -> u32 {
     let u1 = u32::from(self.entity_key[0]);
     let u2 = u32::from(self.entity_key[1]);
     let u3 = u32::from(self.entity_key[2]);
@@ -361,11 +365,16 @@ impl EntityId {
     // This is essentially big-endian encoding
     // The type coercion will always succeed, because we have
     // above a static assert that usize is at least 32-bit
-    ((u1 << 24) | (u2 << 16) | (u3 << 8) | u4) as usize
+    ((u1 << 24) | (u2 << 16) | (u3 << 8) | u4)
   }
+
 
   /// Use this only with usize generated with EntityID::as_usize function.!!!
   fn from_usize(number: usize) -> Self {
+      Self::from_u32(number as u32)
+  }
+
+  pub(crate) fn from_u32(number: u32) -> Self {
     let u4 = (number & 0xFF) as u8;
     let u3 = ((number >> 8) & 0xFF) as u8;
     let u2 = ((number >> 16) & 0xFF) as u8;
@@ -383,7 +392,6 @@ impl EntityId {
     } else {
       warn!("EntityId::from_usize tried to decode 0x{:x?}", number);
     }
-
     result
   }
 
