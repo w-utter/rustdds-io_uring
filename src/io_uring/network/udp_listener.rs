@@ -21,6 +21,8 @@ impl <S> Drop for UDPListener<S> {
     }
 }
 
+use crate::io_uring::encoding;
+
 const BUFFER_ENTRIES: u16 = 16;
 
 impl UDPListener<buf_ring_state::Uninit> {
@@ -93,7 +95,7 @@ impl UDPListener<buf_ring_state::Uninit> {
         })
     }
 
-    pub fn register(mut self, ring: &mut io_uring::IoUring, buf_id: &mut u16, udata: u64) -> std::io::Result<UDPListener<buf_ring_state::Init>> {
+    pub fn register(mut self, ring: &mut io_uring::IoUring, buf_id: &mut u16, domain_id: u16, kind: encoding::user_data::UdpDataRecv) -> std::io::Result<UDPListener<buf_ring_state::Init>> {
         use core::ptr;
         // SAFETY: were never using `self` here again
         let socket = unsafe { ptr::read(&self.socket) };
@@ -119,7 +121,7 @@ impl UDPListener<buf_ring_state::Uninit> {
         use io_uring::{opcode, types::Fd};
         use std::os::fd::AsRawFd;
 
-        let recv_multi = opcode::RecvMulti::new(Fd(socket.as_raw_fd()), buf.bgid()).build().user_data(udata);
+        let recv_multi = opcode::RecvMulti::new(Fd(socket.as_raw_fd()), buf.bgid()).build().user_data(encoding::UserData::new(domain_id, encoding::user_data::Variant::DataRecv(kind)).into());
 
         unsafe {
             ring
@@ -176,12 +178,15 @@ mod tests {
   use super::*;
   use crate::network::udp_sender::*;
 
+  use crate::io_uring::encoding::user_data::UdpDataRecv;
+  const DUMMY_ID: UdpDataRecv = UdpDataRecv::MulticastDiscovery;
+
   #[test]
   fn udpl_single_address() {
     let mut ring = io_uring::IoUring::new(8).unwrap();
     let mut id = 1;
 
-    let mut listener = UDPListener::new_unicast("127.0.0.1".parse().unwrap(), 10001).unwrap().register(&mut ring, &mut id, 0).unwrap();
+    let mut listener = UDPListener::new_unicast("127.0.0.1".parse().unwrap(), 10001).unwrap().register(&mut ring, &mut id, 0, DUMMY_ID).unwrap();
 
     let sender = UDPSender::new_with_random_port().expect("failed to create UDPSender");
 
@@ -208,7 +213,7 @@ mod tests {
     let mut ring = io_uring::IoUring::new(8).unwrap();
     let mut id = 1;
 
-    let mut listener = UDPListener::new_multicast("0.0.0.0".parse().unwrap(), 10003, Ipv4Addr::new(239, 255, 0, 1)).unwrap().register(&mut ring, &mut id, 0).unwrap();
+    let mut listener = UDPListener::new_multicast("0.0.0.0".parse().unwrap(), 10003, Ipv4Addr::new(239, 255, 0, 1)).unwrap().register(&mut ring, &mut id, 0, DUMMY_ID).unwrap();
 
     let sender = UDPSender::new_with_random_port().unwrap();
 

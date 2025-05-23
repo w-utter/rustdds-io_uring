@@ -115,14 +115,14 @@ impl UDPSender {
         Ok(())
     }
 
-    fn send_to_locator_list(&self, buf: &[u8], locators: &[Locator], ring: &mut io_uring::IoUring) -> std::io::Result<()> {
+    pub(crate) fn send_to_locator_list(&self, buf: &[u8], locators: &[Locator], ring: &mut io_uring::IoUring) -> std::io::Result<()> {
         for loc in locators {
             self.send_to_locator(buf, loc, ring)?;
         }
         Ok(())
     }
 
-    fn send_to_locator(&self, buf: &[u8], locator: &Locator, ring: &mut io_uring::IoUring) -> std::io::Result<()> {
+    pub(crate) fn send_to_locator(&self, buf: &[u8], locator: &Locator, ring: &mut io_uring::IoUring) -> std::io::Result<()> {
         match locator {
             Locator::UdpV4(addr) => self.send_to_socket(buf, SocketAddr::from(*addr), ring),
             Locator::UdpV6(addr) => self.send_to_socket(buf, SocketAddr::from(*addr), ring),

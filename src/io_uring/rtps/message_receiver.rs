@@ -8,7 +8,7 @@ use bytes::Bytes;
 
 use crate::{
   messages::{protocol_version::ProtocolVersion, submessages::submessages::*, vendor_id::VendorId},
-  rtps::{reader::Reader, Message, Submessage, SubmessageBody},
+  rtps::{Message, Submessage, SubmessageBody},
   structure::{
     entity::RTPSEntity,
     guid::{EntityId, GuidPrefix, GUID},
@@ -16,6 +16,9 @@ use crate::{
     time::Timestamp,
   },
 };
+
+use crate::io_uring::rtps::reader::Reader;
+use crate::io_uring::timer::timer_state;
 
 use crate::rtps::message_receiver::{
     SecureReceiverState, 
@@ -41,7 +44,7 @@ use crate::structure::sequence_number::SequenceNumber;
 
 const RTPS_MESSAGE_HEADER_SIZE: usize = 20;
 
-enum SubmessageSideEffect {
+pub(crate) enum SubmessageSideEffect {
     AckNack(GuidPrefix, AckSubmessage),
     SpdpLiveness(GuidPrefix),
 }
@@ -53,7 +56,7 @@ enum SubmessageSideEffect {
 /// SUbmessages and forwards data in Entity Submessages to the appropriate
 /// Entities. (See RTPS spec Section 8.3.7)
 pub(crate) struct MessageReceiver {
-  pub available_readers: BTreeMap<EntityId, Reader>,
+  pub available_readers: BTreeMap<EntityId, Reader<timer_state::Init>>,
   // GuidPrefix sent in this channel needs to be RTPSMessage source_guid_prefix. Writer needs this
   // to locate RTPSReaderProxy if negative acknack.
   // We send notification of remote DomainParticipant liveness to Discovery to
@@ -138,7 +141,7 @@ impl MessageReceiver {
     }
   }
 
-  pub fn add_reader(&mut self, new_reader: Reader) {
+  pub fn add_reader(&mut self, new_reader: Reader<timer_state::Init>) {
     let eid = new_reader.guid().entity_id;
     match self.available_readers.entry(eid) {
       Entry::Occupied(_) => warn!("Already have Reader {:?} - not adding.", eid),
@@ -148,15 +151,15 @@ impl MessageReceiver {
     }
   }
 
-  pub fn remove_reader(&mut self, old_reader_guid: GUID) -> Option<Reader> {
+  pub fn remove_reader(&mut self, old_reader_guid: GUID) -> Option<Reader<timer_state::Init>> {
     self.available_readers.remove(&old_reader_guid.entity_id)
   }
 
-  pub fn reader_mut(&mut self, reader_id: EntityId) -> Option<&mut Reader> {
+  pub fn reader_mut(&mut self, reader_id: EntityId) -> Option<&mut Reader<timer_state::Init>> {
     self.available_readers.get_mut(&reader_id)
   }
 
-  pub fn handle_received_packet(&mut self, msg_bytes: &Bytes) -> Option<impl Iterator<Item = SubmessageSideEffect> + use<'_>> {
+  pub fn handle_received_packet<'a, 'b>(&'a mut self, msg_bytes: &Bytes, ring: &'b mut io_uring::IoUring) -> Option<impl Iterator<Item = SubmessageSideEffect> + use<'a, 'b>> {
     // Check for RTPS ping message. At least RTI implementation sends these.
     // What should we do with them? The spec does not say.
     if msg_bytes.len() < RTPS_MESSAGE_HEADER_SIZE {
@@ -205,14 +208,14 @@ impl MessageReceiver {
       }
     };
 
-    Some(self.handle_parsed_message(rtps_message))
+    Some(self.handle_parsed_message(rtps_message, ring))
   }
 
   // This is also called directly from dp_event_loop in case of loopback messages.
 
 
   // this should return an iterator over Spdp / acknack messages.
-  pub fn handle_parsed_message(&mut self, rtps_message: Message) -> impl Iterator<Item = SubmessageSideEffect> + use<'_> {
+  pub fn handle_parsed_message<'a, 'b>(&'a mut self, rtps_message: Message, ring: &'b mut io_uring::IoUring) -> impl Iterator<Item = SubmessageSideEffect> + use<'a, 'b> {
     self.reset();
     self.dest_guid_prefix = self.own_guid_prefix;
     self.source_guid_prefix = rtps_message.header.guid_prefix;
@@ -283,10 +286,10 @@ impl MessageReceiver {
       }
     };
 
-    SubmessageIter::new(self, decoded_message.submessages)
+    SubmessageIter::new(self, decoded_message.submessages, ring)
   }
 
-  fn handle_submessage(&mut self, submessage: Submessage, sub_iter: &mut Option<(TargetReaderEntityIdIter, WriterSubmessage)>) -> Option<SubmessageSideEffect> {
+  fn handle_submessage(&mut self, submessage: Submessage, sub_iter: &mut Option<(TargetReaderEntityIdIter, WriterSubmessage)>, ring: &mut io_uring::IoUring) -> Option<SubmessageSideEffect> {
     match self.secure_receiver_state.take() {
       // Note that .take() always resets the state to "None", so we must
       // set it in every branch where it should remain in some other value.
@@ -330,7 +333,7 @@ impl MessageReceiver {
                     let mut iter = available_target_entity_ids.into_iter();
 
                     let ret = iter.next().map(|target_id| {
-                        self.handle_writer_submessage(target_id, submessage.clone())
+                        self.handle_writer_submessage(target_id, submessage.clone(), ring)
                     });
 
                     *sub_iter = Some((iter.into(), submessage));
@@ -365,7 +368,7 @@ impl MessageReceiver {
             } else {
               match security_plugins_clone {
                 None => {
-                    return self.handle_writer_submessage(receiver_entity_id, submessage);
+                    return self.handle_writer_submessage(receiver_entity_id, submessage, ring);
                 }
 
                 #[cfg(not(feature = "security"))]
@@ -518,6 +521,7 @@ impl MessageReceiver {
     &mut self,
     target_reader_entity_id: EntityId,
     submessage: WriterSubmessage,
+    ring: &mut io_uring::IoUring,
   ) -> Option<SubmessageSideEffect> {
     if self.dest_guid_prefix != self.own_guid_prefix && self.dest_guid_prefix != GuidPrefix::UNKNOWN
     {
@@ -589,6 +593,7 @@ impl MessageReceiver {
           &heartbeat,
           flags.contains(HEARTBEAT_Flags::Final),
           &mr_state,
+          ring,
         );
         return None;
       }
@@ -624,7 +629,7 @@ impl MessageReceiver {
     _source_guid: &GUID,
     data: Data,
     data_flags: BitFlags<DATA_Flags, u8>,
-    reader: &mut Reader,
+    reader: &mut Reader<timer_state::Init>,
     mr_state: &MessageReceiverState,
   ) {
     reader.handle_data_msg(data, data_flags, mr_state);
@@ -683,7 +688,7 @@ impl MessageReceiver {
     _source_guid: &GUID,
     datafrag: DataFrag,
     datafrag_flags: BitFlags<DATAFRAG_Flags, u8>,
-    reader: &mut Reader,
+    reader: &mut Reader<timer_state::Init>,
     mr_state: &MessageReceiverState,
   ) {
     let payload_buffer_length = datafrag.serialized_payload.len();
@@ -823,6 +828,7 @@ impl MessageReceiver {
     sec_prefix: &SecurePrefix,
     encoded_submessage: &Submessage,
     sec_postfix: &SecurePostfix,
+    ring: &mut io_uring::IoUring,
   ) -> Option<SubmessageSideEffect> {
     let security_plugins = self.security_plugins.clone();
     match security_plugins {
@@ -1004,19 +1010,10 @@ impl MessageReceiver {
     }
   }
 
-  pub fn notify_data_to_readers(&mut self, readers: Vec<EntityId>) {
-    for eid in readers {
-      self
-        .available_readers
-        .get_mut(&eid)
-        .map(Reader::notify_cache_change);
-    }
-  }
-
   // sends 0 seqnum acknacks for those writer that haven't had any action
-  pub fn send_preemptive_acknacks(&mut self) {
+  pub fn send_preemptive_acknacks(&mut self, ring: &mut io_uring::IoUring) {
     for reader in self.available_readers.values_mut() {
-      reader.send_preemptive_acknacks();
+      reader.send_preemptive_acknacks(ring);
     }
   }
 
@@ -1078,16 +1075,18 @@ mod tests {
     },
     messages::header::Header,
     mio_source,
-    network::udp_sender::UDPSender,
-    rtps::reader::ReaderIngredients,
     serialization::from_bytes,
     structure::{dds_cache::DDSCache, guid::EntityKind},
   };
+
+  use crate::io_uring::rtps::reader::ReaderIngredients;
+  use crate::io_uring::network::udp_sender::UDPSender;
   use super::*;
 
   #[test]
 
   fn test_shapes_demo_message_deserialization() {
+      let mut ring = io_uring::IoUring::new(16).expect("no ring");
     // The following message bytes contain serialized INFO_DST, INFO_TS, DATA &
     // HEARTBEAT submessages. The DATA submessage contains a ShapeType value.
     // The bytes have been captured from WireShark.
@@ -1127,18 +1126,6 @@ mod tests {
       EntityId::create_custom_entity_id([0, 0, 0], EntityKind::READER_WITH_KEY_USER_DEFINED);
     let reader_guid = GUID::new_with_prefix_and_id(target_gui_prefix, entity);
 
-    let (notification_sender, _notification_receiver) = mio_channel::sync_channel::<()>(100);
-    let (_notification_event_source, notification_event_sender) =
-      mio_source::make_poll_channel().unwrap();
-    let data_reader_waker = Arc::new(Mutex::new(None));
-
-    let (status_sender, _status_receiver) = sync_status_channel::<DataReaderStatus>(4).unwrap();
-    let (participant_status_sender, _participant_status_receiver) =
-      sync_status_channel(16).unwrap();
-
-    let (_reader_command_sender, reader_command_receiver) =
-      mio_channel::sync_channel::<ReaderCommand>(10);
-
     let qos_policy = QosPolicies::qos_none();
 
     let dds_cache = Arc::new(RwLock::new(DDSCache::new()));
@@ -1150,24 +1137,17 @@ mod tests {
     );
     let reader_ing = ReaderIngredients {
       guid: reader_guid,
-      notification_sender,
-      status_sender,
       topic_name: "test".to_string(),
       topic_cache_handle: topic_cache_handle.clone(),
       like_stateless: false,
       qos_policy,
-      data_reader_command_receiver: reader_command_receiver,
-      data_reader_waker: data_reader_waker.clone(),
-      poll_event_sender: notification_event_sender,
       security_plugins: None,
     };
 
     let mut new_reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new_with_random_port().unwrap()),
-      mio_extras::timer::Builder::default().build(),
-      participant_status_sender,
-    );
+    ).register(&mut ring, 0).unwrap();
 
     // Add info of the writer to the reader
     new_reader.matched_writer_add(
@@ -1181,7 +1161,7 @@ mod tests {
     // Add reader to message reader and process the bytes message
     message_receiver.add_reader(new_reader);
 
-    let res = message_receiver.handle_received_packet(&udp_bits1).expect("could not parse bits");
+    let res = message_receiver.handle_received_packet(&udp_bits1, &mut ring).expect("could not parse bits");
 
     for _a in res {
     }
@@ -1223,6 +1203,7 @@ mod tests {
 
   #[test]
   fn mr_test_submsg_count() {
+      let mut ring = io_uring::IoUring::new(16).expect("no ring");
     // Udp packet with INFO_DST, INFO_TS, DATA, HEARTBEAT
     let udp_bits1 = Bytes::from_static(&[
       0x52, 0x54, 0x50, 0x53, 0x02, 0x03, 0x01, 0x0f, 0x01, 0x0f, 0x99, 0x06, 0x78, 0x34, 0x00,
@@ -1248,12 +1229,12 @@ mod tests {
     let mut message_receiver =
       MessageReceiver::new(guid_new.prefix, None);
 
-    let mut res = message_receiver.handle_received_packet(&udp_bits1).expect("could not parse udp bits");
+    let mut res = message_receiver.handle_received_packet(&udp_bits1, &mut ring).expect("could not parse udp bits");
     for _a in res {
     }
     assert_eq!(message_receiver.submessage_count, 4);
 
-    let mut res_2 = message_receiver.handle_received_packet(&udp_bits2).expect("could not parse udp bits");
+    let mut res_2 = message_receiver.handle_received_packet(&udp_bits2, &mut ring).expect("could not parse udp bits");
     for _a in res_2 {
     }
     assert_eq!(message_receiver.submessage_count, 2);
@@ -1289,29 +1270,25 @@ impl Iterator for TargetReaderEntityIdIter {
     }
 }
 
-struct SubmessageIter<'a> {
+pub(crate) struct SubmessageIter<'a, 'b> {
     msg_recv: &'a mut MessageReceiver,
     writer_iter: Option<(TargetReaderEntityIdIter, WriterSubmessage)>,
     submsgs: std::vec::IntoIter<Submessage>,
+    ring: &'b mut io_uring::IoUring,
 }
 
-impl <'a> SubmessageIter<'a> {
-    fn new(receiver: &'a mut MessageReceiver, submsgs: Vec<Submessage>) -> Self {
+impl <'a, 'b> SubmessageIter<'a, 'b> {
+    fn new(receiver: &'a mut MessageReceiver, submsgs: Vec<Submessage>, ring: &'b mut io_uring::IoUring) -> Self {
         Self {
             msg_recv: receiver,
             submsgs: submsgs.into_iter(),
             writer_iter: None,
-        }
-    }
-
-    #[cfg(test)]
-    fn drive(&mut self) {
-        while let Some(_) = self.next() {
+            ring,
         }
     }
 }
 
-impl Iterator for SubmessageIter<'_> {
+impl Iterator for SubmessageIter<'_, '_> {
     type Item = SubmessageSideEffect;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1333,7 +1310,7 @@ impl Iterator for SubmessageIter<'_> {
                 };
 
                 if cond {
-                    if let Some(ret) = self.msg_recv.handle_writer_submessage(target_reader, writer_msg.clone()) {
+                    if let Some(ret) = self.msg_recv.handle_writer_submessage(target_reader, writer_msg.clone(), self.ring) {
                         return Some(ret);
                     } else {
                         continue;
@@ -1349,7 +1326,7 @@ impl Iterator for SubmessageIter<'_> {
 
         self.msg_recv.submessage_count += 1;
 
-        if let Some(ret) = self.msg_recv.handle_submessage(sub_msg, &mut self.writer_iter) {
+        if let Some(ret) = self.msg_recv.handle_submessage(sub_msg, &mut self.writer_iter, self.ring) {
             return Some(ret);
         } else {
             return self.next();
