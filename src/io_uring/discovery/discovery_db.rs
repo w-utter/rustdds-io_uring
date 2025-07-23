@@ -12,7 +12,7 @@ use crate::{
   dds::{
     participant::DomainParticipant,
     qos::HasQoSPolicy,
-    statusevents::{DomainParticipantStatusEvent, LostReason, StatusChannelSender},
+    statusevents::{DomainParticipantStatusEvent, LostReason},
     topic::{Topic, TopicDescription},
   },
   rtps::{
@@ -47,8 +47,8 @@ const PARTICIPANT_LEASE_DURATION_TOLERANCE: Duration = Duration::from_secs(0);
 
 // TODO: Let DiscoveryDB itself become thread-safe and support smaller-scope
 // lock
-pub(crate) struct DiscoveryDB {
-  my_guid: GUID,
+pub struct DiscoveryDB {
+  pub(crate) my_guid: GUID,
   participant_proxies: BTreeMap<GuidPrefix, SpdpDiscoveredParticipantData>,
   participant_last_life_signs: BTreeMap<GuidPrefix, Instant>,
 
@@ -410,7 +410,7 @@ impl DiscoveryDB {
   // them from the remote participant.
   //
   // The topic is updated to the topics table.
-  pub fn update_subscription(&mut self, data: &DiscoveredReaderData) -> DiscoveredReaderData {
+  pub fn update_subscription(&mut self, data: &DiscoveredReaderData) -> (DiscoveredReaderData, Option<DomainParticipantStatusEvent>) {
     let guid = data.reader_proxy.remote_reader_guid;
 
     self.external_topic_readers.insert(guid, data.clone());
@@ -442,7 +442,7 @@ impl DiscoveryDB {
 
     // Now the topic update:
     let dtd = data.subscription_topic_data.to_topic_data();
-    self.update_topic_data(
+    let status_event = self.update_topic_data(
       &DiscoveredTopicData::new(Utc::now(), dtd),
       guid,
       DiscoveredVia::Subscription,
@@ -453,18 +453,18 @@ impl DiscoveryDB {
     // from that record and modify by QoS given in the DRD.
 
     // Return DiscoveredReaderData with possibly updated locators.
-    DiscoveredReaderData {
+    (DiscoveredReaderData {
       reader_proxy: ReaderProxy::from(RtpsReaderProxy::from_discovered_reader_data(
         data,
         &default_locator_lists.0,
         &default_locator_lists.1,
       )),
       ..data.clone()
-    }
+    }, status_event)
   }
 
   // TODO: This is silly. Returns one of the parameters cloned, or None
-  pub fn update_publication(&mut self, data: &DiscoveredWriterData) -> DiscoveredWriterData {
+  pub fn update_publication(&mut self, data: &DiscoveredWriterData) -> (DiscoveredWriterData, Option<DomainParticipantStatusEvent>) {
     let guid = data.writer_proxy.remote_writer_guid;
 
     self
@@ -499,24 +499,24 @@ impl DiscoveryDB {
 
     // Now the topic update:
     let dtd = data.publication_topic_data.to_topic_data();
-    self.update_topic_data(
+    let status_event = self.update_topic_data(
       &DiscoveredTopicData::new(Utc::now(), dtd),
       guid,
       DiscoveredVia::Publication,
     );
 
-    DiscoveredWriterData {
+    (DiscoveredWriterData {
       writer_proxy: WriterProxy::from(RtpsWriterProxy::from_discovered_writer_data(
         data,
         &default_locator_lists.0,
         &default_locator_lists.1,
       )),
       ..data.clone()
-    }
+    }, status_event)
   }
 
   // This is for local participant updating the topic table
-  pub fn update_topic_data_p(&mut self, topic: &Topic) {
+  pub fn update_topic_data_p(&mut self, topic: &Topic) -> Option<DomainParticipantStatusEvent> {
     let topic_data = DiscoveredTopicData::new(
       Utc::now(),
       TopicBuiltinTopicData::new(
@@ -526,7 +526,7 @@ impl DiscoveryDB {
         &topic.qos(),
       ),
     );
-    self.update_topic_data(&topic_data, self.my_guid, DiscoveredVia::SelfDefined);
+    self.update_topic_data(&topic_data, self.my_guid, DiscoveredVia::SelfDefined)
   }
 
   // Topic update sends notifications, in case someone was waiting to find a

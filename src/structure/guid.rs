@@ -365,7 +365,7 @@ impl EntityId {
     // This is essentially big-endian encoding
     // The type coercion will always succeed, because we have
     // above a static assert that usize is at least 32-bit
-    ((u1 << 24) | (u2 << 16) | (u3 << 8) | u4)
+    (u1 << 24) | (u2 << 16) | (u3 << 8) | u4
   }
 
 

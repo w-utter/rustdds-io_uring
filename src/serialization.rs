@@ -1,6 +1,6 @@
 mod cdr_adapters;
 
-pub(crate) mod pl_cdr_adapters;
+pub mod pl_cdr_adapters;
 pub(crate) mod speedy_pl_cdr_helpers;
 
 mod representation_identifier;

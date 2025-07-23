@@ -171,9 +171,9 @@ mod serialization_test;
 mod checked_impl;
 #[doc(hidden)]
 pub mod discovery; // to access some Discovered data in e.g. ros2-client crate
-mod messages;
+pub mod messages;
 mod network;
-mod rtps;
+pub mod rtps;
 
 #[cfg(feature = "security")]
 mod security;
@@ -198,7 +198,7 @@ pub mod ros2;
 /// Helpers for (De)serialization and definitions of (De)serializer adapters
 pub mod serialization;
 
-mod io_uring;
+pub mod io_uring;
 
 // Re-exports from crate root to simplify usage
 #[doc(inline)]
@@ -226,8 +226,9 @@ pub use serialization::{
   CDRDeserializerAdapter, CDRSerializerAdapter, CdrDeserializer, CdrSerializer,
 };
 pub use structure::{
-  duration::Duration, entity::RTPSEntity, guid::GUID, sequence_number::SequenceNumber,
+  duration::Duration, entity::RTPSEntity, guid::{GUID, EntityId}, sequence_number::SequenceNumber,
   time::Timestamp,
+  dds_cache::{DDSCache, TopicCache},
 };
 // re-export from a helper crate
 /// Helper trait to compute the CDR-serialized size of data

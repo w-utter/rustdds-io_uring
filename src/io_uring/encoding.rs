@@ -11,6 +11,14 @@ impl UserData {
             variant,
         }
     }
+
+    pub fn domain_id(&self) -> u16 {
+        self.domain_id
+    }
+
+    pub fn variant(&self) -> user_data::Variant {
+        self.variant
+    }
 }
 
 impl From<UserData> for u64 {
@@ -38,11 +46,11 @@ impl From<UserData> for u64 {
                         // since theres only 1 variant (for now?),
                         // we dont need to encode it into the user data
                         let read_timer_variant = match kind {
-                            ReadTimerVariant::RequestedDeadline => 0,
+                            ReadTimerVariant::RequestedDeadline => 1,
                         };
 
                         let rest = eid.as_u32() as u64;
-                        (1, rest)
+                        (read_timer_variant, rest)
                     }
                     Timer::Write(eid, kind) => {
                         let write_timer_variant = match kind {
@@ -58,6 +66,11 @@ impl From<UserData> for u64 {
                         let rest = match kind {
                             BuiltinTimerVariant::CacheCleaning => 1,
                             BuiltinTimerVariant::AckNack => 2,
+
+                            BuiltinTimerVariant::ParticipantCleaning => 3,
+                            BuiltinTimerVariant::TopicCleaning => 4,
+                            BuiltinTimerVariant::SpdpPublish => 5,
+                            BuiltinTimerVariant::ParticipantMessages => 6,
                         };
                         (3, rest)
                     }
@@ -67,7 +80,7 @@ impl From<UserData> for u64 {
                 (2, rest)
             }
         };
-        let rest = (variant | rest << 3);
+        let rest = variant | (rest << 3);
         domain_id | (rest << 16)
     }
 }
@@ -123,9 +136,14 @@ impl TryFrom<u64> for UserData {
                     }
                     3 => {
                         // builtin
-                        let kind = match raw & 0b111 {
+                        let kind = match raw & 0b1111 {
                             1 => BuiltinTimerVariant::CacheCleaning,
                             2 => BuiltinTimerVariant::AckNack,
+
+                            3 => BuiltinTimerVariant::ParticipantCleaning,
+                            4 => BuiltinTimerVariant::TopicCleaning,
+                            5 => BuiltinTimerVariant::SpdpPublish,
+                            6 => BuiltinTimerVariant::ParticipantMessages,
                             _ => return Err(()),
                         };
                         Timer::Builtin(kind)
@@ -184,8 +202,14 @@ pub mod user_data {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum BuiltinTimerVariant {
+        // domain events
         AckNack,
         CacheCleaning,
+        // discovery events
+        ParticipantCleaning,
+        TopicCleaning,
+        SpdpPublish,
+        ParticipantMessages,
     }
 }
 
@@ -234,6 +258,11 @@ mod tests {
     fn builtin_timer() {
         with_domain_ids!(Variant::Timer(Timer::Builtin(BuiltinTimerVariant::AckNack)));
         with_domain_ids!(Variant::Timer(Timer::Builtin(BuiltinTimerVariant::CacheCleaning)));
+
+        with_domain_ids!(Variant::Timer(Timer::Builtin(BuiltinTimerVariant::ParticipantCleaning)));
+        with_domain_ids!(Variant::Timer(Timer::Builtin(BuiltinTimerVariant::TopicCleaning)));
+        with_domain_ids!(Variant::Timer(Timer::Builtin(BuiltinTimerVariant::SpdpPublish)));
+        with_domain_ids!(Variant::Timer(Timer::Builtin(BuiltinTimerVariant::ParticipantMessages)));
     }
 
     #[test]

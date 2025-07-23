@@ -13,7 +13,6 @@ use crate::{
   dds::{participant::DomainParticipant, qos::QosPolicies},
   discovery::sedp_messages::DiscoveredReaderData,
   messages::submessages::submessage::AckSubmessage,
-  rtps::constant::*,
   structure::{
     guid::{EntityId, GUID},
     locator::Locator,

@@ -257,7 +257,7 @@ pub struct TokenReceiverPair<T> {
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum DiscoveryNotificationType {
+pub enum DiscoveryNotificationType {
   ReaderUpdated {
     discovered_reader_data: DiscoveredReaderData,
   },
@@ -280,6 +280,7 @@ pub(crate) enum DiscoveryNotificationType {
     writer_guid: GUID,
     manual_assertion: bool,
   },
+  TopicDiscovered,
   #[cfg(feature = "security")]
   ParticipantAuthenticationStatusChanged {
     guid_prefix: GuidPrefix,

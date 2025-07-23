@@ -2,7 +2,7 @@
 //! crate top level and modules [`no_key`](crate::no_key) and
 //! [`with_key`](crate::with_key).
 
-mod helpers;
+pub(crate) mod helpers;
 
 pub(crate) mod participant;
 pub use participant::DomainParticipant;

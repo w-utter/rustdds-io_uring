@@ -1,17 +1,17 @@
 use timerfd::{TimerFd, TimerState, SetTimeFlags};
-pub(crate) struct Timer<T, S> {
+pub struct Timer<T, S> {
     state: S,
     t: T,
 }
 
-pub(crate) mod timer_state {
+pub mod timer_state {
     use timerfd::{TimerFd, TimerState, SetTimeFlags};
-    pub(crate) struct Uninit {
+    pub struct Uninit {
         pub(crate) state: TimerState,
         pub(crate) flags: Option<SetTimeFlags>,
     }
 
-    pub(crate) struct Init {
+    pub struct Init {
         pub(crate) tfd: TimerFd,
         pub(super) prev_state: TimerState,
     }
@@ -74,7 +74,7 @@ impl <T> Timer<T, Uninit> {
         use std::os::fd::AsRawFd;
 
         use io_uring::{opcode, types::Fd};
-        let poll = opcode::PollAdd::new(Fd(tfd.as_raw_fd()), libc::POLLIN as _)
+        let poll = opcode::PollAdd::new(Fd(tfd.as_raw_fd()), libc::POLLIN as _).multi(matches!(state, TimerState::Periodic{..}))
             .build().user_data(encoding::UserData::new(domain_id, user_data::Variant::Timer(kind)).into());
 
         unsafe {

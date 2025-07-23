@@ -48,17 +48,17 @@ pub(crate) enum ReaderCommand {
 // This is helper struct.
 // All mutable state needed for reading should go here.
 pub(crate) struct ReadState<K: Key> {
-  latest_instant: Timestamp, /* This is used as a read pointer from dds_cache for BEST_EFFORT
+  pub(crate) latest_instant: Timestamp, /* This is used as a read pointer from dds_cache for BEST_EFFORT
                               * reading */
-  last_read_sn: BTreeMap<GUID, SequenceNumber>, // collection of read pointers for RELIABLE reading
+  pub(crate) last_read_sn: BTreeMap<GUID, SequenceNumber>, // collection of read pointers for RELIABLE reading
   /// hash_to_key_map is used for decoding received key hashes back to original
   /// key values. This is needed when we receive a dispose message via hash
   /// only.
-  hash_to_key_map: BTreeMap<KeyHash, K>, // TODO: garbage collect this somehow
+  pub(crate) hash_to_key_map: BTreeMap<KeyHash, K>, // TODO: garbage collect this somehow
 }
 
 impl<K: Key> ReadState<K> {
-  fn new() -> Self {
+  pub(crate) fn new() -> Self {
     ReadState {
       latest_instant: Timestamp::ZERO,
       last_read_sn: BTreeMap::new(),
@@ -69,7 +69,7 @@ impl<K: Key> ReadState<K> {
   // This is a helper function so that borrow checker understands
   // that we are splitting one mutable borrow into two _disjoint_ mutable
   // borrows.
-  fn get_sn_map_and_hash_map(
+  pub(crate) fn get_sn_map_and_hash_map(
     &mut self,
   ) -> (
     &mut BTreeMap<GUID, SequenceNumber>,
@@ -222,7 +222,7 @@ where
     }
   }
 
-  fn update_hash_to_key_map(
+  pub(crate) fn update_hash_to_key_map(
     hash_to_key_map: &mut BTreeMap<KeyHash, D::K>,
     deserialized: &Sample<D, D::K>,
   ) {

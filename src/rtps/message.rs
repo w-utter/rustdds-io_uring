@@ -110,7 +110,7 @@ impl<C: Context> Writable<C> for Message {
 }
 
 #[derive(Default, Clone)]
-pub(crate) struct MessageBuilder {
+pub struct MessageBuilder {
   submessages: Vec<Submessage>,
 }
 

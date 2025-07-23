@@ -1,8 +1,6 @@
 use std::{
   collections::BTreeMap,
   fmt, iter,
-  rc::Rc,
-  sync::{Arc, Mutex, MutexGuard},
   time::Duration as StdDuration,
 };
 
@@ -16,7 +14,7 @@ use crate::{
     ddsdata::DDSData,
     qos::{policy, HasQoSPolicy, QosPolicies},
     statusevents::{
-      CountWithChange, DataReaderStatus, DomainParticipantStatusEvent, StatusChannelSender,
+      CountWithChange, DataReaderStatus, DomainParticipantStatusEvent,
     },
     with_key::{
       datawriter::{WriteOptions, WriteOptionsBuilder},
@@ -35,7 +33,6 @@ use crate::{
     },
     vendor_id::VendorId,
   },
-  mio_source,
   rtps::{
     fragment_assembler::FragmentAssembler, message_receiver::MessageReceiverState,
     rtps_writer_proxy::RtpsWriterProxy, Message,
@@ -52,8 +49,6 @@ use crate::{
   },
 };
 
-use crate::io_uring::network::udp_sender::UDPSender;
-
 #[cfg(feature = "security")]
 use super::Submessage;
 #[cfg(feature = "security")]
@@ -65,14 +60,12 @@ use crate::rtps::reader::TimedEvent;
 
 // Some pieces necessary to construct a reader.
 // These can be sent between threads, whereas a Reader cannot.
-pub(crate) struct ReaderIngredients {
+pub struct ReaderIngredients {
   pub guid: GUID,
   pub topic_name: String,
-  pub(crate) topic_cache_handle: Arc<Mutex<TopicCache>>, /* A handle to the topic cache in DDS
-                                                          * cache */
-  pub(crate) like_stateless: bool, // Usually false (see like_stateless attribute of Reader)
+  pub like_stateless: bool, // Usually false (see like_stateless attribute of Reader)
   pub qos_policy: QosPolicies,
-  pub(crate) security_plugins: Option<SecurityPluginsHandle>,
+  pub security_plugins: Option<SecurityPluginsHandle>,
 }
 
 impl ReaderIngredients {
@@ -94,9 +87,37 @@ impl fmt::Debug for ReaderIngredients {
 
 use crate::io_uring::timer::{Timer, timer_state};
 
-pub(crate) struct Reader<S> {
-  udp_sender: Rc<UDPSender>,
+pub struct Timers<S> {
+  pub(crate) timed_event_timer: Option<Timer<(), S>>,
+}
 
+impl Timers<timer_state::Uninit> {
+    pub fn new(deadline: Option<policy::Deadline>) -> Self {
+        let timed_event_timer = deadline.map(|deadline| Timer::new_periodic((), deadline.0.into()));
+
+        Self {
+            timed_event_timer,
+        }
+    }
+
+    pub fn register(self, ring: &mut io_uring::IoUring, entity_id: EntityId, domain_id: u16) -> std::io::Result<Timers<timer_state::Init>> {
+        let Self {
+            timed_event_timer
+        } = self;
+
+        //use crate::io_uring::encoding::user_data::ReadTimerVariant;
+        use crate::io_uring::encoding::user_data;
+
+        let timed_event_timer = timed_event_timer.map(|timer| timer.register(ring, domain_id, user_data::Timer::Read(entity_id, user_data::ReadTimerVariant::RequestedDeadline))).transpose()?;
+
+        Ok(Timers {
+            timed_event_timer,
+        })
+    }
+}
+
+
+pub struct Reader<S> {
   // By default, this reader is a StatefulReader (see RTPS spec section 8.4.12)
   // If like_stateless is true, then the reader mimics the behavior of a StatelessReader
   // This means for example that the reader does not keep track of matched remote writers.
@@ -106,7 +127,6 @@ pub(crate) struct Reader<S> {
   // Reliability Qos. Note that a StatelessReader cannot be Reliable (RTPS Spec: Section 8.4.11.2)
   reliability: policy::Reliability,
   // Reader stores a pointer to a mutex on the topic cache
-  topic_cache: Arc<Mutex<TopicCache>>,
 
   #[cfg(test)]
   seqnum_instant_map: BTreeMap<SequenceNumber, Timestamp>,
@@ -132,7 +152,7 @@ pub(crate) struct Reader<S> {
   requested_deadline_missed_count: i32,
   offered_incompatible_qos_count: i32,
 
-  pub(crate) timed_event_timer: Option<Timer<(), S>>,
+  pub(crate) timers: Timers<S>,
 
   #[allow(dead_code)] // to avoid warning if no security feature
   security_plugins: Option<SecurityPluginsHandle>,
@@ -145,34 +165,22 @@ const FRAGMENT_ASSEMBLY_TIMEOUT: Duration = Duration::from_secs(10);
 const MIN_FRAGMENT_GC_INTERVAL: Duration = Duration::from_secs(2);
 
 impl Reader<timer_state::Uninit> {
-  pub(crate) fn new(
+  pub fn new(
     i: ReaderIngredients,
-    udp_sender: Rc<UDPSender>,
   ) -> Self {
-    // Verify that the topic cache corresponds to the topic of the Reader
-    let topic_cache_name = i.topic_cache_handle.lock().unwrap().topic_name();
-    if i.topic_name != topic_cache_name {
-      panic!(
-        "Topic name = {} and topic cache name = {} not equal when creating a Reader",
-        i.topic_name, topic_cache_name
-      );
-    }
-
     // If reader should be stateless, only BestEffort QoS is supported
     if i.like_stateless && i.qos_policy.is_reliable() {
       panic!("Attempted to create a stateless Reader with other than BestEffort reliability");
     }
 
-    let timed_event_timer = i.qos_policy.deadline.map(|deadline| Timer::new_periodic((), deadline.0.into()));
+    let timers = Timers::new(i.qos_policy.deadline);
 
     Self {
-      udp_sender,
       like_stateless: i.like_stateless,
       reliability: i
         .qos_policy
         .reliability() // use qos specification
         .unwrap_or(policy::Reliability::BestEffort), // or default to BestEffort
-      topic_cache: i.topic_cache_handle,
       topic_name: i.topic_name,
       qos_policy: i.qos_policy,
 
@@ -189,17 +197,15 @@ impl Reader<timer_state::Uninit> {
       writer_match_count_total: 0,
       requested_deadline_missed_count: 0,
       offered_incompatible_qos_count: 0,
-      timed_event_timer,
+      timers,
       security_plugins: i.security_plugins,
     }
   }
 
-  pub(crate) fn register(self, ring: &mut io_uring::IoUring, domain_id: u16) -> std::io::Result<Reader<timer_state::Init>> {
+  pub fn register(self, ring: &mut io_uring::IoUring, domain_id: u16) -> std::io::Result<Reader<timer_state::Init>> {
     let Self {
-      udp_sender,
       like_stateless,
       reliability,
-      topic_cache,
       topic_name,
       qos_policy,
       #[cfg(test)]
@@ -214,20 +220,17 @@ impl Reader<timer_state::Uninit> {
       writer_match_count_total,
       requested_deadline_missed_count,
       offered_incompatible_qos_count,
-      timed_event_timer,
+      timers,
       security_plugins,
     } = self;
 
-    use crate::io_uring::encoding::user_data::{Timer, ReadTimerVariant};
 
     let entity_id = self.my_guid.entity_id;
-    let timed_event_timer = timed_event_timer.map(|timer| timer.register(ring, domain_id, Timer::Read(entity_id, ReadTimerVariant::RequestedDeadline))).transpose()?;
+    let timers = timers.register(ring, entity_id, domain_id)?;
 
     Ok(Reader {
-      udp_sender,
       like_stateless,
       reliability,
-      topic_cache,
       topic_name,
       qos_policy,
       #[cfg(test)]
@@ -242,7 +245,7 @@ impl Reader<timer_state::Uninit> {
       writer_match_count_total,
       requested_deadline_missed_count,
       offered_incompatible_qos_count,
-      timed_event_timer,
+      timers,
       security_plugins,
     })
   }
@@ -260,7 +263,7 @@ impl Reader<timer_state::Init> {
 
   pub fn set_requested_deadline_check_timer(&mut self) {
     if let Some(deadline) = self.qos_policy.deadline {
-        if let Some(t) = self.timed_event_timer.as_mut() {
+        if let Some(t) = self.timers.timed_event_timer.as_mut() {
             t.try_update_duration(deadline.0.into(), None);
         }
       debug!(
@@ -321,8 +324,7 @@ impl Reader<timer_state::Init> {
 
   // TODO Used for test/debugging purposes
   #[cfg(test)]
-  pub fn history_cache_change_data(&self, sequence_number: SequenceNumber) -> Option<DDSData> {
-    let topic_cache = self.acquire_the_topic_cache_guard();
+  pub fn history_cache_change_data(&self, sequence_number: SequenceNumber, topic_cache: &mut TopicCache) -> Option<DDSData> {
     let cc = self
       .seqnum_instant_map
       .get(&sequence_number)
@@ -445,7 +447,7 @@ impl Reader<timer_state::Init> {
 
   // Entire remote participant was lost.
   // Remove all remote writers belonging to it.
-  pub fn participant_lost(&mut self, guid_prefix: GuidPrefix) -> impl Iterator<Item = DataReaderStatus> + use<'_> {
+  pub fn participant_lost(&mut self, guid_prefix: GuidPrefix) -> LostWriters<'_> {
     let lost_writers: Vec<GUID> = self
       .matched_writers
       .range(guid_prefix.range())
@@ -501,6 +503,7 @@ impl Reader<timer_state::Init> {
     data: Data,
     data_flags: BitFlags<DATA_Flags>,
     mr_state: &MessageReceiverState,
+    topic_cache: &mut TopicCache,
   ) -> bool {
     // trace!("handle_data_msg entry");
     let receive_timestamp = Timestamp::now();
@@ -535,6 +538,7 @@ impl Reader<timer_state::Init> {
         write_options_b.build(),
         writer_guid,
         writer_seq_num,
+        topic_cache,
       ),
       Err(e) => {
           debug!("Parsing DATA to DDSData failed: {}", e);
@@ -548,6 +552,7 @@ impl Reader<timer_state::Init> {
     datafrag: &DataFrag,
     datafrag_flags: BitFlags<DATAFRAG_Flags>,
     mr_state: &MessageReceiverState,
+    topic_cache: &mut TopicCache,
   ) {
     let writer_guid = GUID::new_with_prefix_and_id(mr_state.source_guid_prefix, datafrag.writer_id);
     let seq_num = datafrag.writer_sn;
@@ -610,6 +615,7 @@ impl Reader<timer_state::Init> {
         write_options_b.build(),
         writer_guid,
         writer_seq_num,
+        topic_cache,
       );
     } else {
       self.garbage_collect_fragments();
@@ -678,6 +684,7 @@ impl Reader<timer_state::Init> {
     write_options: WriteOptions,
     writer_guid: GUID,
     writer_sn: SequenceNumber,
+    topic_cache: &mut TopicCache,
   ) -> bool {
     trace!(
       "handle_data_msg from {:?} seq={:?} topic={:?} reliability={:?} stateless={:?}",
@@ -727,6 +734,7 @@ impl Reader<timer_state::Init> {
       write_options,
       writer_guid,
       writer_sn,
+      topic_cache,
     );
 
     // Add to own track-keeping data structure
@@ -841,6 +849,7 @@ impl Reader<timer_state::Init> {
     final_flag_set: bool,
     mr_state: &MessageReceiverState,
     ring: &mut io_uring::IoUring,
+    topic_cache: &mut TopicCache,
   ) -> (bool, bool) {
     let writer_guid =
       GUID::new_with_prefix_and_id(mr_state.source_guid_prefix, heartbeat.writer_id);
@@ -894,9 +903,7 @@ impl Reader<timer_state::Init> {
         // remove changes until first_sn.
         writer_proxy.irrelevant_changes_up_to(heartbeat.first_sn);
 
-        let marker_moved = this
-          .acquire_the_topic_cache_guard()
-          .mark_reliably_received_before(writer_guid, writer_proxy.all_ackable_before());
+        let marker_moved = topic_cache.mark_reliably_received_before(writer_guid, writer_proxy.all_ackable_before());
         // let received_before = writer_proxy.all_ackable_before();
         let reader_id = this.entity_id();
 
@@ -1033,7 +1040,7 @@ impl Reader<timer_state::Init> {
   } // fn
 
   // returns true on cache change
-  pub fn handle_gap_msg(&mut self, gap: &Gap, mr_state: &MessageReceiverState) -> bool {
+  pub fn handle_gap_msg(&mut self, gap: &Gap, mr_state: &MessageReceiverState, topic_cache: &mut TopicCache) -> bool {
     // ATM all things related to groups is ignored. TODO?
 
     let writer_guid = GUID::new_with_prefix_and_id(mr_state.source_guid_prefix, gap.writer_id);
@@ -1095,9 +1102,7 @@ impl Reader<timer_state::Init> {
     }
 
     // Get the topic cache and mark progress
-    let marker_moved = self
-      .acquire_the_topic_cache_guard()
-      .mark_reliably_received_before(writer_guid, all_ackable_before);
+    let marker_moved = topic_cache.mark_reliably_received_before(writer_guid, all_ackable_before);
 
     // Receiving a GAP could make a Reliable stream.
     // E.g. we had #2, but were missing #1. Now GAP says that #1 does not exist.
@@ -1162,17 +1167,15 @@ impl Reader<timer_state::Init> {
     write_options: WriteOptions,
     writer_guid: GUID,
     writer_sn: SequenceNumber,
+    topic_cache: &mut TopicCache,
   ) {
     let cache_change = CacheChange::new(writer_guid, writer_sn, write_options, data);
 
-    // Get the topic cache
-    let mut tc = self.acquire_the_topic_cache_guard();
-
-    tc.add_change(&receive_timestamp, cache_change);
+    topic_cache.add_change(&receive_timestamp, cache_change);
     // Mark seqnums as received if not behaving statelessly
     if !self.like_stateless {
       self.matched_writer(writer_guid).map(|wp| {
-        tc.mark_reliably_received_before(writer_guid, wp.all_ackable_before());
+        topic_cache.mark_reliably_received_before(writer_guid, wp.all_ackable_before());
         // Here we do not need to notify waiting DataReader, because
         // the upper call level from here does it.
       });
@@ -1191,9 +1194,12 @@ impl Reader<timer_state::Init> {
       .write_to_vec_with_ctx(Endianness::LittleEndian)
       .unwrap(); //TODO!
     let _dummy = message; // consume it to avoid clippy warning
+    todo!("send by passing udp_sender by ref")
+        /*
     self
       .udp_sender
       .send_to_locator_list(&bytes, dst_locator_list, ring);
+      */
   }
 
   #[cfg(feature = "security")]
@@ -1208,9 +1214,12 @@ impl Reader<timer_state::Init> {
         let bytes = message
           .write_to_vec_with_ctx(Endianness::LittleEndian)
           .unwrap(); //TODO!!
+        todo!("send by passing udp_sender by ref")
+        /*
         self
           .udp_sender
           .send_to_locator_list(&bytes, dst_locator_list);
+          */
       }
       Err(e) => error!("Failed to send message to writers. Encoding failed: {e:?}"),
     }
@@ -1362,15 +1371,6 @@ impl Reader<timer_state::Init> {
   pub fn topic_name(&self) -> &String {
     &self.topic_name
   }
-
-  fn acquire_the_topic_cache_guard(&self) -> MutexGuard<TopicCache> {
-    self.topic_cache.lock().unwrap_or_else(|e| {
-      panic!(
-        "The topic cache of topic {} is poisoned. Error: {}",
-        &self.topic_name, e
-      )
-    })
-  }
 } // impl Reader
 
 impl HasQoSPolicy for Reader<timer_state::Init> {
@@ -1457,7 +1457,7 @@ impl Iterator for MissedDeadlines<'_> {
     }
 }
 
-struct LostWriters<'a> {
+pub struct LostWriters<'a> {
     reader: &'a mut Reader<timer_state::Init>,
     iter: std::vec::IntoIter<GUID>,
 }
@@ -1472,12 +1472,12 @@ impl <'a> LostWriters<'a> {
 }
 
 impl Iterator for LostWriters<'_> {
-    type Item = DataReaderStatus;
+    type Item = (DataReaderStatus, GUID);
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(next) = self.iter.next() {
             if let Some(lost) = self.reader.remove_writer_proxy(next) {
-                return Some(lost);
+                return Some((lost, next));
             }
         }
         None
@@ -1502,11 +1502,11 @@ mod tests {
       let mut ring = io_uring::IoUring::new(16).unwrap();
     // 1. Create a reader
     // Create the DDS cache and a topic
-    let dds_cache = Arc::new(RwLock::new(DDSCache::new()));
+    let mut dds_cache = DDSCache::new();
     let topic_name = "test_name";
     let qos_policy = QosPolicies::qos_none();
 
-    let topic_cache_handle = dds_cache.write().unwrap().add_new_topic(
+    let topic_cache = dds_cache.add_new_topic(
       topic_name.to_string(),
       TypeDesc::new("test_type".to_string()),
       &qos_policy,
@@ -1517,7 +1517,6 @@ mod tests {
     let reader_ing = ReaderIngredients {
       guid: reader_guid,
       topic_name: topic_name.to_string(),
-      topic_cache_handle,
       like_stateless: false,
       qos_policy,
       security_plugins: None,
@@ -1552,7 +1551,7 @@ mod tests {
     let data_flags = BitFlags::<DATA_Flags>::from_flag(DATA_Flags::Data);
 
     // 4. Feed the data for the reader to handle
-    let notif = reader.handle_data_msg(data, data_flags, &mr_state);
+    let notif = reader.handle_data_msg(data, data_flags, &mr_state, &mut topic_cache.lock().unwrap());
 
     // 5. Verify that the reader sends a notification about the new data
     assert!(
@@ -1568,22 +1567,23 @@ mod tests {
       let mut ring = io_uring::IoUring::new(32).unwrap();
     // 1. Create a reader
     // Create the DDS cache and a topic
-    let dds_cache = Arc::new(RwLock::new(DDSCache::new()));
+    let mut dds_cache = DDSCache::new();
     let topic_name = "test_name";
     let qos_policy = QosPolicies::qos_none();
 
-    let topic_cache_handle = dds_cache.write().unwrap().add_new_topic(
+    let topic_cache_handle = dds_cache.add_new_topic(
       topic_name.to_string(),
       TypeDesc::new("test_type".to_string()),
       &qos_policy,
     );
+
+    let mut topic_cache = topic_cache_handle.lock().unwrap();
 
     // Then create the reader
     let reader_guid = GUID::dummy_test_guid(EntityKind::READER_NO_KEY_USER_DEFINED);
     let reader_ing = ReaderIngredients {
       guid: reader_guid,
       topic_name: topic_name.to_string(),
-      topic_cache_handle: topic_cache_handle.clone(),
       like_stateless: false,
       qos_policy,
       security_plugins: None,
@@ -1621,7 +1621,7 @@ mod tests {
     let sequence_num = data.writer_sn;
 
     // 4. Feed the data for the reader to handle
-    reader.handle_data_msg(data.clone(), data_flags, &mr_state);
+    reader.handle_data_msg(data.clone(), data_flags, &mr_state, &mut topic_cache);
 
     // 5. Verify that the reader sent the data to the topic cache
     let topic_cache = topic_cache_handle.lock().unwrap();
@@ -1651,7 +1651,7 @@ mod tests {
       let mut ring = io_uring::IoUring::new(32).unwrap();
     // 1. Create a reader for a topic with Reliable QoS
     // Create the DDS cache and the topic
-    let dds_cache = Arc::new(RwLock::new(DDSCache::new()));
+    let mut dds_cache = DDSCache::new();
     let topic_name = "test_name";
     let reliable_qos = QosPolicyBuilder::new()
       .reliability(Reliability::Reliable {
@@ -1659,7 +1659,7 @@ mod tests {
       })
       .build();
 
-    let topic_cache_handle = dds_cache.write().unwrap().add_new_topic(
+    let topic_cache = dds_cache.add_new_topic(
       topic_name.to_string(),
       TypeDesc::new("test_type".to_string()),
       &reliable_qos,
@@ -1670,7 +1670,6 @@ mod tests {
     let reader_ing = ReaderIngredients {
       guid: reader_guid,
       topic_name: topic_name.to_string(),
-      topic_cache_handle,
       like_stateless: false,
       qos_policy: reliable_qos.clone(),
       security_plugins: None,
@@ -1706,7 +1705,7 @@ mod tests {
       count: 1,
     };
 
-    assert!(!reader.handle_heartbeat_msg(&hb_new, true, &mr_state, &mut ring).0); // should be false, no ack
+    assert!(!reader.handle_heartbeat_msg(&hb_new, true, &mr_state, &mut ring, &mut topic_cache.lock().unwrap()).0); // should be false, no ack
 
     // 4. Send the first proper heartbeat, reader should respond with acknack
     let hb_one = Heartbeat {
@@ -1716,12 +1715,12 @@ mod tests {
       last_sn: SequenceNumber::new(1),
       count: 2,
     };
-    assert!(reader.handle_heartbeat_msg(&hb_one, false, &mr_state, &mut ring).0); // Should send an ack_nack
+    assert!(reader.handle_heartbeat_msg(&hb_one, false, &mr_state, &mut ring, &mut topic_cache.lock().unwrap()).0); // Should send an ack_nack
 
     // 5. Send a duplicate of the first heartbeat, reader should not respond with
     // acknack
     let hb_one2 = hb_one.clone();
-    assert!(!reader.handle_heartbeat_msg(&hb_one2, false, &mr_state, &mut ring).0); // No acknack
+    assert!(!reader.handle_heartbeat_msg(&hb_one2, false, &mr_state, &mut ring, &mut topic_cache.lock().unwrap()).0); // No acknack
 
     // 6. Send a second proper heartbeat, reader should respond with acknack
     let hb_2 = Heartbeat {
@@ -1731,7 +1730,9 @@ mod tests {
       last_sn: SequenceNumber::new(3),  // writer has written 3 samples
       count: 3,
     };
-    assert!(reader.handle_heartbeat_msg(&hb_2, false, &mr_state, &mut ring).0); // Should send an ack_nack
+
+
+    assert!(reader.handle_heartbeat_msg(&hb_2, false, &mr_state, &mut ring, &mut topic_cache.lock().unwrap()).0); // Should send an ack_nack
 
     // 7. Count of acknack sent should be 2
     // The count is verified from the writer proxy
@@ -1756,12 +1757,13 @@ mod tests {
       &qos_policy,
     );
 
+    let mut topic_cache = topic_cache_handle.lock().unwrap();
+
     // Then create the reader
     let reader_guid = GUID::dummy_test_guid(EntityKind::READER_NO_KEY_USER_DEFINED);
     let reader_ing = ReaderIngredients {
       guid: reader_guid,
       topic_name: topic_name.to_string(),
-      topic_cache_handle,
       like_stateless: false,
       qos_policy,
       security_plugins: None,
@@ -1800,7 +1802,7 @@ mod tests {
       gap_start,
       gap_list,
     };
-    reader.handle_gap_msg(&gap, &mr_state);
+    reader.handle_gap_msg(&gap, &mr_state, &mut topic_cache);
 
     // 4. Verify that the writer proxy reports seqnums below 3 as ackable
     // This should be the case since seqnums 1-2 were marked as irrelevant
@@ -1820,7 +1822,7 @@ mod tests {
     };
     let data_flags = BitFlags::<DATA_Flags>::from_flag(DATA_Flags::Data);
 
-    reader.handle_data_msg(data, data_flags, &mr_state);
+    reader.handle_data_msg(data, data_flags, &mr_state, &mut topic_cache);
 
     // 6. Verify that the writer proxy reports seqnums below 5 as ackable
     // This should be the case since reader received data with seqnum 3 and seqnum 4
@@ -1846,7 +1848,7 @@ mod tests {
       gap_start,
       gap_list,
     };
-    reader.handle_gap_msg(&gap, &mr_state);
+    reader.handle_gap_msg(&gap, &mr_state, &mut topic_cache);
 
     // 8. Verify that the writer proxy reports seqnums below 6 as ackable
     assert_eq!(
@@ -1863,13 +1865,13 @@ mod tests {
       let mut ring = io_uring::IoUring::new(16).unwrap();
     // 1. Create a stateless-like reader
     // Create the DDS cache and a topic
-    let dds_cache = Arc::new(RwLock::new(DDSCache::new()));
+    let mut dds_cache = DDSCache::new();
     let topic_name = "test_name";
     let qos_policy = QosPolicies::builder()
       .reliability(Reliability::BestEffort) // Stateless needs to be BestEffort
       .build();
 
-    let topic_cache_handle = dds_cache.write().unwrap().add_new_topic(
+    let topic_cache = dds_cache.add_new_topic(
       topic_name.to_string(),
       TypeDesc::new("test_type".to_string()),
       &qos_policy,
@@ -1880,7 +1882,6 @@ mod tests {
     let reader_ing = ReaderIngredients {
       guid: reader_guid,
       topic_name: topic_name.to_string(),
-      topic_cache_handle,
       like_stateless,
       qos_policy,
       security_plugins: None,

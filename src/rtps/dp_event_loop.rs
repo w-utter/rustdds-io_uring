@@ -375,6 +375,7 @@ impl DPEventLoop {
                     ParticipantAuthenticationStatusChanged { guid_prefix } => {
                       ev_wrapper.on_remote_participant_authentication_status_changed(guid_prefix);
                     }
+                    TopicDiscovered => unreachable!(),
                   }
                 }
               }

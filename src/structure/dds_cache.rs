@@ -110,26 +110,26 @@ impl DDSCache {
 }
 
 #[derive(Debug)]
-pub(crate) struct TopicCache {
+pub struct TopicCache {
   topic_name: String,
   #[allow(dead_code)] // TODO: Which (future) feature needs this?
   topic_data_type: TypeDesc,
   #[allow(dead_code)]
   // TODO: The relevant data here is in min/max keep_samples. Is this still relevant?
-  topic_qos: QosPolicies,
+  pub(crate) topic_qos: QosPolicies,
   min_keep_samples: History,
   max_keep_samples: i32, // from QoS, for quick, repeated access
   // TODO: Change this to Option<u32>, where None means "no limit".
 
   // The main content of the cache is in this map.
   // Timestamp is assumed to be unique id over all the CacheChanges.
-  changes: BTreeMap<Timestamp, CacheChange>,
+  pub(crate) changes: BTreeMap<Timestamp, CacheChange>,
 
   // The underlying Bytes buffers are reallocated after some time (once for each) in
   // order to release the original receive buffer. The idea behind this is that if a CacheChange
   // persists in the TopicCaceh for some time, it should no longer hold onto the receive buffer,
   // so we can recycle the buffers. Otherwise, we (practically) leak memory.
-  changes_reallocated_up_to: Timestamp,
+  pub(crate) changes_reallocated_up_to: Timestamp,
 
   // sequence_numbers is an index to "changes" by GUID and SN
   sequence_numbers: BTreeMap<GUID, BTreeMap<SequenceNumber, Timestamp>>,
@@ -309,6 +309,10 @@ impl TopicCache {
         .map(|(i, c)| (*i, c)),
     )
   }
+
+  // TODO: make this iter better, make a fn that combines both so that the iterators dont have to
+  // be boxed.
+
 
   pub fn get_changes_in_range_reliable<'a>(
     &'a self,

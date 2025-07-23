@@ -5,12 +5,18 @@ pub(crate) mod dp_event_loop;
 pub(crate) mod fragment_assembler;
 pub(crate) mod message_receiver;
 pub(crate) mod reader;
+pub use reader::{Reader, ReaderIngredients};
 pub(crate) mod rtps_reader_proxy;
 pub(crate) mod rtps_writer_proxy;
 pub(crate) mod writer;
+pub use writer::{Writer, WriterIngredients};
 
 pub(crate) mod message;
-pub(crate) use message::{Message, MessageBuilder};
+pub use message::{Message, MessageBuilder};
+
 
 pub(crate) mod submessage;
-pub(crate) use submessage::{Submessage, SubmessageBody};
+pub use submessage::{Submessage, SubmessageBody};
+
+
+pub use message_receiver::MessageReceiver;

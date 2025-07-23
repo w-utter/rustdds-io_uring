@@ -40,7 +40,7 @@ impl UDPSender {
                     mc_socket.set_multicast_loop_v4(true)?;
                     mc_socket
                 }
-                IpAddr::V6(v6) => {
+                IpAddr::V6(_v6) => {
                     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 
                     socket.bind(&SockAddr::from(SocketAddr::new(multicast_if_ipaddr, 0)))?;

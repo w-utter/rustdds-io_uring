@@ -395,7 +395,7 @@ where
   // before this call obtained by select_*_for_access functions. This function
   // will blindly assume that the given keys and timestamps are present in the
   // cache. Function will panic if somthign is not found.
-  pub(in crate::dds::with_key) fn read_by_keys(
+  pub(crate) fn read_by_keys(
     &mut self,
     keys: &[(Timestamp, D::K)],
   ) -> Vec<DataSample<&D>> {
@@ -465,7 +465,7 @@ where
   // before this call obtained by select_*_for_access functions. This function
   // will blindly assume that the given keys and timestamps are present in the
   // cache. Function will panic if somthign is not found.
-  pub(in crate::dds::with_key) fn take_by_keys(
+  pub(crate) fn take_by_keys(
     &mut self,
     keys: &[(Timestamp, D::K)],
   ) -> Vec<DataSample<D>> {
@@ -514,7 +514,7 @@ where
   // before this call obtained by select_*_for_access functions. This function
   // will blindly assume that the given keys and timestamps are present in the
   // cache. Function will panic if somthign is not found.
-  pub(in crate::dds::with_key) fn read_bare_by_keys(
+  pub(crate) fn read_bare_by_keys(
     &mut self,
     keys: &[(Timestamp, D::K)],
   ) -> Vec<Sample<&D, D::K>> {
@@ -557,7 +557,7 @@ where
   // before this call obtained by select_*_for_access functions. This function
   // will blindly assume that the given keys and timestamps are present in the
   // cache. Function will panic if somthign is not found.
-  pub(in crate::dds::with_key) fn take_bare_by_keys(
+  pub(crate) fn take_bare_by_keys(
     &mut self,
     keys: &[(Timestamp, D::K)],
   ) -> Vec<Sample<D, D::K>> {
@@ -586,7 +586,7 @@ where
     result
   }
 
-  pub(in crate::dds::with_key) fn next_key(&self, key: &D::K) -> Option<D::K> {
+  pub(crate) fn next_key(&self, key: &D::K) -> Option<D::K> {
     self
       .instance_map
       .range((Bound::Excluded(key), Bound::Unbounded))

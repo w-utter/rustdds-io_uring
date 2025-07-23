@@ -1,15 +1,16 @@
 use crate::dds::result::{CreateResult, CreateError};
-use crate::{create_error_out_of_resources, create_error_poisoned};
+use crate::create_error_out_of_resources;
 
-use io_uring_buf_ring::buf_ring_state;
+use io_uring_buf_ring::{buf_ring_state, BufferId};
 use crate::io_uring::network::udp_listener::UDPListener;
 use crate::network::constant as network;
 use std::net::{IpAddr, Ipv4Addr};
+use crate::io_uring::encoding::user_data::UdpDataRecv;
 
-use log::{debug, error, info, trace, warn};
+use log::{info, warn};
 
 // section 9.6.1.1 discovery traffic
-pub(crate) struct UdpListeners<S> {
+pub struct UdpListeners<S> {
     multicast_discovery: Option<UDPListener<S>>,
     unicast_discovery: UDPListener<S>,
     multicast_user_traffic: Option<UDPListener<S>>,
@@ -18,7 +19,7 @@ pub(crate) struct UdpListeners<S> {
 
 impl UdpListeners<buf_ring_state::Uninit> {
     // returns the participant id
-    pub(crate) fn try_new(domain_id: u16) -> CreateResult<(Self, u16)> {
+    pub fn try_new(domain_id: u16) -> CreateResult<(Self, u16)> {
         const UNSPECIFIED_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 
 
@@ -109,7 +110,6 @@ impl UdpListeners<buf_ring_state::Uninit> {
             unicast_user_traffic,
         } = self;
 
-        use crate::io_uring::encoding::user_data::UdpDataRecv;
 
         let multicast_discovery = multicast_discovery.map(|disc| disc.register(ring, buf_id, domain_id, UdpDataRecv::MulticastDiscovery)).transpose()?;
 
@@ -126,4 +126,50 @@ impl UdpListeners<buf_ring_state::Uninit> {
             unicast_user_traffic,
         })
     }
+}
+
+impl UdpListeners<buf_ring_state::Init> {
+    pub fn buffer_from_cqe<'a, 'b>(&'a mut self, kind: UdpDataRecv, entry: &'b io_uring::cqueue::Entry) -> std::io::Result<Option<BufferId<'a, 'b, io_uring::cqueue::Entry>>> { 
+        let buffer = match kind {
+            UdpDataRecv::UnicastUserTraffic => &mut self.unicast_user_traffic,
+            UdpDataRecv::MulticastUserTraffic => {
+                let Some(traffic) = self.multicast_user_traffic.as_mut() else {
+                    return Ok(None)
+                };
+                traffic
+            }
+            UdpDataRecv::MulticastDiscovery => {
+                let Some(discovery) = self.multicast_discovery.as_mut() else {
+                    return Ok(None)
+                };
+                discovery
+            }
+            UdpDataRecv::UnicastDiscovery => &mut self.unicast_discovery,
+        };
+        buffer.buf_ring().buffer_id_from_cqe(entry)
+    }
+
+    pub(crate) fn self_locators(&self) -> TrafficLocators {
+        let multicast_discovery = self.multicast_discovery.as_ref().map(|l| l.to_locator_address().ok()).flatten().unwrap_or_default();
+        let unicast_discovery = self.unicast_discovery.to_locator_address().unwrap_or_default();
+
+        let multicast_user_traffic = self.multicast_user_traffic.as_ref().map(|l| l.to_locator_address().ok()).flatten().unwrap_or_default();
+        let unicast_user_traffic = self.unicast_user_traffic.to_locator_address().unwrap_or_default();
+
+        TrafficLocators {
+            multicast_discovery,
+            unicast_discovery,
+            multicast_user_traffic,
+            unicast_user_traffic,
+        }
+    }
+}
+
+use crate::structure::locator::Locator;
+
+pub struct TrafficLocators {
+    pub multicast_discovery: Vec<Locator>,
+    pub unicast_discovery: Vec<Locator>,
+    pub multicast_user_traffic: Vec<Locator>,
+    pub unicast_user_traffic: Vec<Locator>,
 }

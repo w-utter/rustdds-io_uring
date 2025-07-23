@@ -68,7 +68,7 @@ pub(crate) enum TimedEvent {
 
 // Some pieces necessary to construct a reader.
 // These can be sent between threads, whereas a Reader cannot.
-pub(crate) struct ReaderIngredients {
+pub struct ReaderIngredients {
   pub guid: GUID,
   pub notification_sender: mio_channel::SyncSender<()>,
   pub status_sender: StatusChannelSender<DataReaderStatus>,
@@ -101,7 +101,7 @@ impl fmt::Debug for ReaderIngredients {
   }
 }
 
-pub(crate) struct Reader {
+pub struct Reader {
   // Should the instant be sent?
   notification_sender: mio_channel::SyncSender<()>,
   status_sender: StatusChannelSender<DataReaderStatus>,

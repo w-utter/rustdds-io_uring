@@ -2,6 +2,7 @@ use std::net::UdpSocket;
 use std::net::{SocketAddr, IpAddr, Ipv4Addr};
 
 use io_uring_buf_ring::{buf_ring_state, BufRing};
+use crate::network;
 
 const MAX_MESSAGE_SIZE: usize = 64 * 1024; // This is max we can get from UDP.
 const MESSAGE_BUFFER_ALLOCATION_CHUNK: usize = 256 * 1024; // must be >= MAX_MESSAGE_SIZE
@@ -77,7 +78,7 @@ impl UDPListener<buf_ring_state::Uninit> {
 
         let socket = Self::new_listening_socket(addr, port, true)?;
 
-        for multicast_if_ipaddr in crate::network::util::get_local_multicast_ip_addrs()? {
+        for multicast_if_ipaddr in network::util::get_local_multicast_ip_addrs()? {
             match multicast_if_ipaddr {
                 IpAddr::V4(v4) => {
                     socket.join_multicast_v4(&multicast_group, &v4)?;
@@ -95,7 +96,7 @@ impl UDPListener<buf_ring_state::Uninit> {
         })
     }
 
-    pub fn register(mut self, ring: &mut io_uring::IoUring, buf_id: &mut u16, domain_id: u16, kind: encoding::user_data::UdpDataRecv) -> std::io::Result<UDPListener<buf_ring_state::Init>> {
+    pub fn register(self, ring: &mut io_uring::IoUring, buf_id: &mut u16, domain_id: u16, kind: encoding::user_data::UdpDataRecv) -> std::io::Result<UDPListener<buf_ring_state::Init>> {
         use core::ptr;
         // SAFETY: were never using `self` here again
         let socket = unsafe { ptr::read(&self.socket) };
@@ -161,9 +162,21 @@ impl <S> UDPListener<S> {
     }
 }
 
+use crate::structure::locator::Locator;
+
 impl UDPListener<buf_ring_state::Init> {
-    fn buf_ring(&mut self) -> &mut BufRing<buf_ring_state::Init> {
+    pub(crate) fn buf_ring(&mut self) -> &mut BufRing<buf_ring_state::Init> {
         &mut self.buf
+    }
+
+    pub fn to_locator_address(&self) -> std::io::Result<Vec<Locator>> {
+        let local_port = self.socket.local_addr()?.port();
+
+        Ok(if self.multicast_group.is_some() {
+            network::util::get_local_multicast_locators(local_port)
+        } else {
+            network::util::get_local_unicast_locators(local_port)
+        })
     }
 }
 

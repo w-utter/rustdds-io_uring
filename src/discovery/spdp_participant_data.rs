@@ -262,6 +262,92 @@ impl SpdpDiscoveredParticipantData {
       security_info,
     }
   }
+
+  pub(crate) fn from_local(
+    participant_guid: GUID,
+    metatraffic_multicast_locators: Vec<Locator>,
+    metatraffic_unicast_locators: Vec<Locator>,
+    default_multicast_locators: Vec<Locator>,
+    default_unicast_locators: Vec<Locator>,
+    _secure_discovery_opt: &Option<SecureDiscovery>, // If present, security is enabled
+    lease_duration: Duration,
+  ) -> Self {
+    #[allow(unused_mut)] // only security feature mutates this
+    let mut builtin_endpoints = BuiltinEndpointSet::PARTICIPANT_ANNOUNCER
+      | BuiltinEndpointSet::PARTICIPANT_DETECTOR
+      | BuiltinEndpointSet::PUBLICATIONS_ANNOUNCER
+      | BuiltinEndpointSet::PUBLICATIONS_DETECTOR
+      | BuiltinEndpointSet::SUBSCRIPTIONS_ANNOUNCER
+      | BuiltinEndpointSet::SUBSCRIPTIONS_DETECTOR
+      | BuiltinEndpointSet::PARTICIPANT_MESSAGE_DATA_WRITER
+      | BuiltinEndpointSet::PARTICIPANT_MESSAGE_DATA_READER
+      | BuiltinEndpointSet::TOPICS_ANNOUNCER
+      | BuiltinEndpointSet::TOPICS_DETECTOR;
+
+    // Security-related items initially None
+    #[cfg(feature = "security")]
+    let mut identity_token = None;
+    #[cfg(feature = "security")]
+    let mut permissions_token = None;
+    #[cfg(feature = "security")]
+    let mut property = None;
+    #[cfg(feature = "security")]
+    let mut security_info = None;
+
+    #[cfg(feature = "security")]
+    if let Some(secure_discovery) = _secure_discovery_opt {
+      // Security enabled, add needed data
+      // Builtin security endpoints
+      builtin_endpoints = builtin_endpoints
+        | BuiltinEndpointSet::PUBLICATIONS_SECURE_WRITER
+        | BuiltinEndpointSet::PUBLICATIONS_SECURE_READER
+        | BuiltinEndpointSet::SUBSCRIPTIONS_SECURE_WRITER
+        | BuiltinEndpointSet::SUBSCRIPTIONS_SECURE_READER
+        | BuiltinEndpointSet::PARTICIPANT_MESSAGE_SECURE_WRITER
+        | BuiltinEndpointSet::PARTICIPANT_MESSAGE_SECURE_READER
+        | BuiltinEndpointSet::PARTICIPANT_STATELESS_MESSAGE_WRITER
+        | BuiltinEndpointSet::PARTICIPANT_STATELESS_MESSAGE_READER
+        | BuiltinEndpointSet::PARTICIPANT_VOLATILE_MESSAGE_SECURE_WRITER
+        | BuiltinEndpointSet::PARTICIPANT_VOLATILE_MESSAGE_SECURE_READER
+        | BuiltinEndpointSet::PARTICIPANT_SECURE_WRITER
+        | BuiltinEndpointSet::PARTICIPANT_SECURE_READER;
+
+      // Tokens and the rest
+      identity_token = Some(secure_discovery.local_dp_identity_token.clone());
+      permissions_token = Some(secure_discovery.local_dp_permissions_token.clone());
+      property = Some(secure_discovery.local_dp_property_qos.clone());
+      security_info = Some(ParticipantSecurityInfo::from(
+        secure_discovery.local_dp_sec_attributes.clone(),
+      ));
+    }
+
+    Self {
+      updated_time: Utc::now(),
+      protocol_version: ProtocolVersion::PROTOCOLVERSION_2_3,
+      vendor_id: VendorId::THIS_IMPLEMENTATION,
+      expects_inline_qos: false,
+      participant_guid,
+      metatraffic_unicast_locators,
+      metatraffic_multicast_locators,
+      default_unicast_locators,
+      default_multicast_locators,
+      available_builtin_endpoints: BuiltinEndpointSet::from_u32(builtin_endpoints),
+      lease_duration: Some(lease_duration),
+      manual_liveliness_count: 0,
+      builtin_endpoint_qos: None,
+      entity_name: None,
+
+      // DDS Security
+      #[cfg(feature = "security")]
+      identity_token,
+      #[cfg(feature = "security")]
+      permissions_token,
+      #[cfg(feature = "security")]
+      property,
+      #[cfg(feature = "security")]
+      security_info,
+    }
+  }
 }
 
 impl PlCdrDeserialize for SpdpDiscoveredParticipantData {
