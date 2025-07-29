@@ -12,12 +12,8 @@ use crate::{
     adapters::with_key::SerializerAdapter,
     ddsdata::DDSData,
     pubsub::Publisher,
-    qos::{
-      policy::Liveliness,
-      HasQoSPolicy, QosPolicies,
-    },
+    qos::{policy::Liveliness, HasQoSPolicy, QosPolicies},
     result::{WriteError, WriteResult},
-    topic::Topic,
   },
   discovery::{discovery::DiscoveryCommand, sedp_messages::SubscriptionBuiltinTopicData},
   messages::submessages::elements::serialized_payload::SerializedPayload,
@@ -28,6 +24,8 @@ use crate::{
   },
   Keyed,
 };
+
+use crate::io_uring::dds::Topic;
 
 use crate::io_uring::rtps::writer::WriterCommand;
 use crate::dds::with_key::WriteOptions;
@@ -78,7 +76,7 @@ where
   SA: SerializerAdapter<D>,
 {
   fn drop(&mut self) {
-      /*
+    /*
     // Tell Publisher to drop the corresponding RTPS Writer
     self.my_publisher.remove_writer(self.my_guid);
 
@@ -101,8 +99,41 @@ where
 }
 
 pub struct DataSample<'a, D: Keyed, SA: SerializerAdapter<D>> {
-    data_writer: &'a DataWriter<D, SA>,
-    cmd: WriterCommand,
+  data_writer: &'a DataWriter<D, SA>,
+  cmd: WriterCommand,
+  refresh_manual_liveliness: bool,
+}
+
+use crate::io_uring::rtps::{Domain, DomainRef};
+use crate::io_uring::discovery::Discovery2;
+use crate::io_uring::timer::timer_state;
+use io_uring_buf_ring::buf_ring_state;
+use crate::io_uring::network::UDPSender;
+impl<D: Keyed, SA: SerializerAdapter<D>> DataSample<'_, D, SA> {
+  pub fn write_to(self, domain: &mut DomainRef<'_, '_>) {
+    let Self {
+      data_writer,
+      cmd,
+      refresh_manual_liveliness,
+    } = self;
+
+    let DomainRef {
+      writers,
+      discovery,
+      ring,
+      udp_sender,
+    } = domain;
+
+    if let Some(writer) = writers.get_mut(&data_writer.my_guid.entity_id) {
+      writer.process_command(udp_sender, ring, cmd);
+    }
+
+    if refresh_manual_liveliness {
+      discovery
+        .liveliness_state
+        .manual_participant_liveness_refresh_requested = true;
+    }
+  }
 }
 
 impl<D, SA> DataWriter<D, SA>
@@ -111,23 +142,20 @@ where
   SA: SerializerAdapter<D>,
 {
   #[allow(clippy::too_many_arguments)]
-  pub(crate) fn new(
-    publisher: Publisher,
-    topic: Topic,
-    qos: QosPolicies,
-    guid: GUID,
-  ) -> (Self, Option<DiscoveryCommand>) {
-
+  pub(crate) fn new(topic: Topic, qos: QosPolicies, guid: GUID) -> (Self, bool) {
     let discovery = Self::discovery_cmd_from_qos(&qos);
 
-    (Self {
-      data_phantom: PhantomData,
-      ser_phantom: PhantomData,
-      my_topic: topic,
-      qos_policy: qos,
-      my_guid: guid,
-      available_sequence_number: AtomicI64::new(1), // valid numbering starts from 1
-    }, discovery)
+    (
+      Self {
+        data_phantom: PhantomData,
+        ser_phantom: PhantomData,
+        my_topic: topic,
+        qos_policy: qos,
+        my_guid: guid,
+        available_sequence_number: AtomicI64::new(1), // valid numbering starts from 1
+      },
+      discovery,
+    )
   }
 
   fn next_sequence_number(&self) -> SequenceNumber {
@@ -144,11 +172,8 @@ where
       .fetch_sub(1, Ordering::Relaxed);
   }
 
-  fn discovery_cmd_from_qos(qos: &QosPolicies) -> Option<DiscoveryCommand> {
-      match qos.liveliness? {
-        Liveliness::Automatic { .. } | Liveliness::ManualByTopic { .. } => None,
-        Liveliness::ManualByParticipant { .. } => Some(DiscoveryCommand::ManualAssertLiveliness),
-      }
+  fn discovery_cmd_from_qos(qos: &QosPolicies) -> bool {
+    matches!(qos.liveliness, Some(Liveliness::ManualByParticipant { .. }))
   }
 
   /// Manually refreshes liveliness
@@ -182,7 +207,7 @@ where
   ///
   /// data_writer.refresh_manual_liveliness();
   /// ```
-  pub fn refresh_manual_liveliness(&self) -> Option<DiscoveryCommand> {
+  pub fn refresh_manual_liveliness(&self) -> bool {
     Self::discovery_cmd_from_qos(&self.qos())
   }
 
@@ -217,16 +242,20 @@ where
   /// let some_data = SomeType { a: 1 };
   /// data_writer.write(some_data, None).unwrap();
   /// ```
-  pub fn write(&self, data: D, source_timestamp: Option<Timestamp>) -> WriteResult<(DataSample<'_, D, SA>, Option<DiscoveryCommand>), D> {
-    let (_, writer, disc) = self.write_with_options(data, WriteOptions::from(source_timestamp))?;
-    Ok((writer, disc))
+  pub fn write(
+    &self,
+    data: D,
+    source_timestamp: Option<Timestamp>,
+  ) -> WriteResult<DataSample<'_, D, SA>, D> {
+    let (_, writer) = self.write_with_options(data, WriteOptions::from(source_timestamp))?;
+    Ok(writer)
   }
 
   pub fn write_with_options(
     &self,
     data: D,
     write_options: WriteOptions,
-  ) -> WriteResult<(SampleIdentity, DataSample<'_, D, SA>, Option<DiscoveryCommand>), D> {
+  ) -> WriteResult<(SampleIdentity, DataSample<'_, D, SA>), D> {
     // serialize
     let send_buffer = match SA::to_bytes(&data) {
       Ok(b) => b,
@@ -252,16 +281,17 @@ where
     let timeout = self.qos().reliable_max_blocking_time();
 
     let sample_identity = SampleIdentity {
-          writer_guid: self.my_guid,
-          sequence_number,
+      writer_guid: self.my_guid,
+      sequence_number,
     };
-    let discovery_command = self.refresh_manual_liveliness();
+    let refresh_manual_liveliness = self.refresh_manual_liveliness();
 
     let data_sample = DataSample {
-        data_writer: self,
-        cmd: writer_command,
+      data_writer: self,
+      cmd: writer_command,
+      refresh_manual_liveliness,
     };
-    Ok((sample_identity, data_sample, discovery_command))
+    Ok((sample_identity, data_sample))
   }
 
   /// This operation blocks the calling thread until either all data written by
@@ -308,10 +338,10 @@ where
   /// data_writer.wait_for_acknowledgments(std::time::Duration::from_millis(100));
   /// ```
   pub fn wait_for_acknowledgments(&self, max_wait: Duration) -> WriteResult<bool, ()> {
-      //TODO: find a better way for this
-      // maybe (timer fd, can cancel it with the encoding and then handle it from there)
-      todo!()
-      /*
+    //TODO: find a better way for this
+    // maybe (timer fd, can cancel it with the encoding and then handle it from there)
+    todo!()
+    /*
     match &self.qos_policy.reliability {
       None | Some(Reliability::BestEffort) => Ok(true),
       Some(Reliability::Reliable { .. }) => {
@@ -595,12 +625,14 @@ where
   /// likely because Discovery has too much work to do.
   pub fn assert_liveliness(&self) -> Option<DiscoveryCommand> {
     match self.qos().liveliness? {
-        Liveliness::ManualByParticipant { .. } => Some(DiscoveryCommand::ManualAssertLiveliness),
-        Liveliness::ManualByTopic { lease_duration: _ } => Some(DiscoveryCommand::AssertTopicLiveliness {
-            writer_guid: self.guid(),
-            manual_assertion: true, // by definition of this function
-        }),
-        _ => None,
+      Liveliness::ManualByParticipant { .. } => Some(DiscoveryCommand::ManualAssertLiveliness),
+      Liveliness::ManualByTopic { lease_duration: _ } => {
+        Some(DiscoveryCommand::AssertTopicLiveliness {
+          writer_guid: self.guid(),
+          manual_assertion: true, // by definition of this function
+        })
+      }
+      _ => None,
     }
   }
 
@@ -694,7 +726,7 @@ where
     &self,
     key: &<D as Keyed>::K,
     source_timestamp: Option<Timestamp>,
-  ) -> WriteResult<(WriterCommand, Option<DiscoveryCommand>), ()> {
+  ) -> WriteResult<(WriterCommand, bool), ()> {
     let send_buffer = SA::key_to_bytes(key).map_err(|e| WriteError::Serialization {
       reason: format!("{e}"),
       data: (),
@@ -706,10 +738,10 @@ where
     );
 
     let writer_cmd = WriterCommand::DDSData {
-        ddsdata,
-        write_options: WriteOptions::from(source_timestamp),
-        sequence_number: self.next_sequence_number(),
-      };
+      ddsdata,
+      write_options: WriteOptions::from(source_timestamp),
+      sequence_number: self.next_sequence_number(),
+    };
 
     let discovery_cmd = self.refresh_manual_liveliness();
     Ok((writer_cmd, discovery_cmd))

@@ -5,6 +5,8 @@ use std::{
   sync::atomic,
 };
 
+use io_uring::IoUring;
+
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use speedy::{Endianness, Writable};
@@ -19,9 +21,7 @@ use crate::{
       policy::{History, Reliability},
       HasQoSPolicy, QosPolicies,
     },
-    statusevents::{
-      CountWithChange, DataWriterStatus, DomainParticipantStatusEvent,
-    },
+    statusevents::{CountWithChange, DataWriterStatus, DomainParticipantStatusEvent},
     with_key::datawriter::WriteOptions,
   },
   messages::submessages::submessages::AckSubmessage,
@@ -49,7 +49,8 @@ use crate::{
 #[cfg(not(feature = "security"))]
 use crate::no_security::SecurityPluginsHandle;
 
-use crate::rtps::writer::{DeliveryMode, TimedEvent, HistoryBuffer};
+use crate::rtps::writer::{DeliveryMode, HistoryBuffer};
+use crate::io_uring::encoding::user_data::WriteTimerVariant;
 
 pub enum WriterCommand {
   // TODO: try to make this more private, like pub(crate)
@@ -58,8 +59,7 @@ pub enum WriterCommand {
     write_options: WriteOptions,
     sequence_number: SequenceNumber,
   },
-  WaitForAcknowledgments
-  // ResetOfferedDeadlineMissedStatus { writer_guid: GUID },
+  WaitForAcknowledgments, // ResetOfferedDeadlineMissedStatus { writer_guid: GUID },
 }
 
 pub struct WriterIngredients {
@@ -170,7 +170,7 @@ pub struct Writer<S> {
   /// self.heartbeat_period timed_event_handler sends notification when timer
   /// is up via mio channel to poll in Dp_eventWrapper this also handles
   /// writers cache cleaning timeouts.
-  pub(crate) timed_event_timer: Timers<S>,
+  pub(crate) timers: Timers<S>,
 
   qos_policies: QosPolicies,
 
@@ -180,101 +180,121 @@ pub struct Writer<S> {
 }
 
 pub struct Timers<S> {
-    pub(crate) heartbeat: Option<Timer<(), S>>,
-    pub(crate) cache_cleaning: Timer<(), S>,
-    pub(crate) send_repair_data: Option<Timer<GUID, S>>,
-    pub(crate) send_repair_frags: Option<Timer<GUID, S>>,
+  pub(crate) heartbeat: Option<Timer<(), S>>,
+  pub(crate) cache_cleaning: Timer<(), S>,
+  pub(crate) send_repair_data: Option<Timer<GUID, S>>,
+  pub(crate) send_repair_frags: Option<Timer<GUID, S>>,
 }
 
 impl Timers<timer_state::Uninit> {
-    pub fn new(cache_cleaning_period: Duration, heartbeat_period: Option<Duration>) -> Self {
-        let heartbeat = heartbeat_period.map(|dur| Timer::new_periodic((), dur.into()));
+  pub fn new(cache_cleaning_period: Duration, heartbeat_period: Option<Duration>) -> Self {
+    let heartbeat = heartbeat_period.map(|dur| Timer::new_periodic((), dur.into()));
 
-        let cache_cleaning = Timer::new_periodic((), cache_cleaning_period.into());
+    let cache_cleaning = Timer::new_periodic((), cache_cleaning_period.into());
 
-        Self {
-            heartbeat,
-            cache_cleaning,
-            send_repair_data: None,
-            send_repair_frags: None,
-        }
+    Self {
+      heartbeat,
+      cache_cleaning,
+      send_repair_data: None,
+      send_repair_frags: None,
     }
+  }
 
-    pub fn register(self, ring: &mut io_uring::IoUring, domain_id: u16, entity_id: EntityId) -> std::io::Result<Timers<timer_state::Init>> {
-        let Self {
-            heartbeat,
-            cache_cleaning,
-            send_repair_data,
-            send_repair_frags,
-        } = self;
+  pub fn register(
+    self,
+    ring: &mut io_uring::IoUring,
+    domain_id: u16,
+    entity_id: EntityId,
+  ) -> std::io::Result<Timers<timer_state::Init>> {
+    let Self {
+      heartbeat,
+      cache_cleaning,
+      send_repair_data,
+      send_repair_frags,
+    } = self;
 
-        use crate::io_uring::encoding::user_data::{Timer, WriteTimerVariant};
-//Timer::Write(eid, kind)
+    use crate::io_uring::encoding::user_data::{Timer, WriteTimerVariant};
+    //Timer::Write(eid, kind)
 
-        let heartbeat = heartbeat.map(|timer| timer.register(ring, domain_id, Timer::Write(entity_id, WriteTimerVariant::Heartbeat))).transpose()?;
-        let cache_cleaning = cache_cleaning.register(ring, domain_id, Timer::Write(entity_id, WriteTimerVariant::CacheCleaning))?;
-        let send_repair_data = send_repair_data.map(|timer| timer.register(ring,domain_id, Timer::Write(entity_id, WriteTimerVariant::SendRepairData))).transpose()?;
-        let send_repair_frags = send_repair_frags.map(|timer| timer.register(ring, domain_id, Timer::Write(entity_id, WriteTimerVariant::SendRepairFrags))).transpose()?;
+    let heartbeat = heartbeat
+      .map(|timer| {
+        timer.register(
+          ring,
+          domain_id,
+          Timer::Write(entity_id, WriteTimerVariant::Heartbeat),
+        )
+      })
+      .transpose()?;
+    let cache_cleaning = cache_cleaning.register(
+      ring,
+      domain_id,
+      Timer::Write(entity_id, WriteTimerVariant::CacheCleaning),
+    )?;
+    let send_repair_data = send_repair_data
+      .map(|timer| {
+        timer.register(
+          ring,
+          domain_id,
+          Timer::Write(entity_id, WriteTimerVariant::SendRepairData),
+        )
+      })
+      .transpose()?;
+    let send_repair_frags = send_repair_frags
+      .map(|timer| {
+        timer.register(
+          ring,
+          domain_id,
+          Timer::Write(entity_id, WriteTimerVariant::SendRepairFrags),
+        )
+      })
+      .transpose()?;
 
-        Ok(Timers {
-            heartbeat,
-            cache_cleaning,
-            send_repair_data,
-            send_repair_frags,
-        })
-    }
+    Ok(Timers {
+      heartbeat,
+      cache_cleaning,
+      send_repair_data,
+      send_repair_frags,
+    })
+  }
 }
 
 impl Timers<timer_state::Init> {
-    fn timed_event(&mut self, id: u8) -> Option<TimedEvent> {
-        match id {
-            // heartbeat
-            1 => self.heartbeat.as_mut().map(|heartbeat| {
-                    heartbeat.reset();
-                    TimedEvent::Heartbeat
-                }),
-            // cache cleaning
-            2 => {
-                self.cache_cleaning.reset();
-                Some(TimedEvent::CacheCleaning)
-            }
-            // repair data
-            3 => core::mem::take(&mut self.send_repair_data).map(|repair_data| {
-                    let guid = repair_data.take_inner();
-                    TimedEvent::SendRepairData {
-                        to_reader: guid,
-                    }
-                }),
-            //  repair frags
-            4 => core::mem::take(&mut self.send_repair_frags).map(|repair_frags| {
-                    let guid = repair_frags.take_inner();
-                    TimedEvent::SendRepairFrags {
-                        to_reader: guid,
-                    }
-            }),
-            _ => None
-        }
-    }
+  fn set_send_repair_frags(&mut self, send_repair_frags: Timer<GUID, timer_state::Init>) {
+    self.send_repair_frags = Some(send_repair_frags);
+  }
 
-    fn set_send_repair_frags(&mut self, send_repair_frags: Timer<GUID, timer_state::Init>) {
-        self.send_repair_frags = Some(send_repair_frags);
-    }
+  pub(crate) fn set_send_repair_data(
+    &mut self,
+    writer_eid: EntityId,
+    remote_reader_guid: GUID,
+    nack_response_delay: Duration,
+    domain_id: u16,
+    ring: &mut io_uring::IoUring,
+  ) {
+    use crate::io_uring::encoding::user_data::{self, WriteTimerVariant};
 
-    fn set_send_repair_data(&mut self, send_repair_data: Timer<GUID, timer_state::Init>) {
-        self.send_repair_data = Some(send_repair_data);
-    }
+    let timer = Timer::new_immediate_oneshot(
+      remote_reader_guid,
+      nack_response_delay.into(),
+      None,
+      ring,
+      domain_id,
+      user_data::Timer::Write(writer_eid, WriteTimerVariant::SendRepairData),
+    )
+    .unwrap();
 
-    fn set_heartbeat_duration(&mut self, duration: Duration) {
-        if let Some(heartbeat) = self.heartbeat.as_mut() {
-            heartbeat.try_update_duration(duration.into(), None)
-        }
+    self.send_repair_data = Some(timer);
+  }
+
+  fn set_heartbeat_duration(&mut self, duration: Duration) {
+    if let Some(heartbeat) = self.heartbeat.as_mut() {
+      heartbeat.try_update_duration(duration.into(), None)
     }
+  }
 }
 
 impl Writer<timer_state::Uninit> {
-  pub fn new(
-    i: WriterIngredients,
-  ) -> Self {
+  pub fn new(i: WriterIngredients) -> Self {
     // If writer should behave statelessly, only BestEffort QoS is currently
     // supported
     if i.like_stateless && i.qos_policies.is_reliable() {
@@ -306,18 +326,7 @@ impl Writer<timer_state::Uninit> {
     // TODO: Configuration value
     let cache_cleaning_period = Duration::from_secs(6);
 
-    // Start periodic Heartbeat
-    /*
-    if let Some(period) = heartbeat_period {
-      timed_event_timer.set_timeout(std::time::Duration::from(period), TimedEvent::Heartbeat);
-    }
-    // start periodic cache cleaning
-    timed_event_timer.set_timeout(
-      std::time::Duration::from(cache_cleaning_period),
-      TimedEvent::CacheCleaning,
-    );
-    */
-    let timed_event_timer = Timers::new(cache_cleaning_period, heartbeat_period);
+    let timers = Timers::new(cache_cleaning_period, heartbeat_period);
 
     Self {
       endianness: Endianness::LittleEndian,
@@ -338,7 +347,7 @@ impl Writer<timer_state::Uninit> {
       requested_incompatible_qos_count: 0,
       my_topic_name: i.topic_name.clone(),
       history_buffer: HistoryBuffer::new(i.topic_name),
-      timed_event_timer,
+      timers,
       like_stateless: i.like_stateless,
       qos_policies: i.qos_policies,
       ack_waiter: None,
@@ -347,57 +356,61 @@ impl Writer<timer_state::Uninit> {
     }
   }
 
-  pub(crate) fn register(self, ring: &mut io_uring::IoUring, domain_id: u16) -> std::io::Result<Writer<timer_state::Init>> {
-      let Self {
-          endianness,
-          heartbeat_message_counter,
-          push_mode,
-          heartbeat_period,
-          cache_cleaning_period,
-          nack_response_delay,
-          nackfrag_response_delay,
-          repairfrags_continue_delay,
-          nack_suppression_duration,
-          data_max_size_serialized,
-          my_guid,
-          readers,
-          matched_readers_count_total,
-          requested_incompatible_qos_count,
-          my_topic_name,
-          history_buffer,
-          timed_event_timer,
-          like_stateless,
-          qos_policies,
-          ack_waiter,
-          security_plugins,
-      } = self;
+  pub(crate) fn register(
+    self,
+    ring: &mut io_uring::IoUring,
+    domain_id: u16,
+  ) -> std::io::Result<Writer<timer_state::Init>> {
+    let Self {
+      endianness,
+      heartbeat_message_counter,
+      push_mode,
+      heartbeat_period,
+      cache_cleaning_period,
+      nack_response_delay,
+      nackfrag_response_delay,
+      repairfrags_continue_delay,
+      nack_suppression_duration,
+      data_max_size_serialized,
+      my_guid,
+      readers,
+      matched_readers_count_total,
+      requested_incompatible_qos_count,
+      my_topic_name,
+      history_buffer,
+      timers,
+      like_stateless,
+      qos_policies,
+      ack_waiter,
+      security_plugins,
+    } = self;
 
-      let entity_id = my_guid.entity_id;
-      let timed_event_timer = timed_event_timer.register(ring, domain_id, entity_id)?;
+    let entity_id = my_guid.entity_id;
+    let timers = timers.register(ring, domain_id, entity_id)?;
 
-      Ok(Writer {
-          endianness,
-          heartbeat_message_counter,
-          push_mode,
-          heartbeat_period,
-          cache_cleaning_period,
-          nack_response_delay,
-          nackfrag_response_delay,
-          repairfrags_continue_delay,
-          nack_suppression_duration,
-          data_max_size_serialized,
-          my_guid,
-          readers,
-          matched_readers_count_total,
-          requested_incompatible_qos_count,
-          my_topic_name,
-          history_buffer,
-          timed_event_timer,
-          like_stateless,
-          qos_policies,
-          ack_waiter,
-          security_plugins,
-      })
+    Ok(Writer {
+      endianness,
+      heartbeat_message_counter,
+      push_mode,
+      heartbeat_period,
+      cache_cleaning_period,
+      nack_response_delay,
+      nackfrag_response_delay,
+      repairfrags_continue_delay,
+      nack_suppression_duration,
+      data_max_size_serialized,
+      my_guid,
+      readers,
+      matched_readers_count_total,
+      requested_incompatible_qos_count,
+      my_topic_name,
+      history_buffer,
+      timers,
+      like_stateless,
+      qos_policies,
+      ack_waiter,
+      security_plugins,
+    })
   }
 }
 
@@ -428,57 +441,81 @@ impl Writer<timer_state::Init> {
   // --------------------------------------------------------------
   // --------------------------------------------------------------
 
-  pub fn handle_timed_event(&mut self, udp_sender: &UDPSender, ring: &mut io_uring::IoUring, timed_event: TimedEvent, domain_id: u16) {
-      match timed_event {
-        TimedEvent::Heartbeat => {
-          self.handle_heartbeat_tick(false, udp_sender, ring);
-          // ^^ false = This is automatic heartbeat by timer, not manual by application
-          // call.
-          if let Some(period) = self.heartbeat_period {
-            self
-              .timed_event_timer.set_heartbeat_duration(period)
+  pub fn handle_timed_event(
+    &mut self,
+    udp_sender: &UDPSender,
+    ring: &mut io_uring::IoUring,
+    timed_event: WriteTimerVariant,
+    domain_id: u16,
+  ) {
+    match timed_event {
+      WriteTimerVariant::Heartbeat => {
+        //println!("explicit writer heartbeat");
+        self.timers.heartbeat.as_mut().map(|hb| hb.reset());
+        self.handle_heartbeat_tick(false, udp_sender, ring);
+        // ^^ false = This is automatic heartbeat by timer, not manual by application
+      }
+      WriteTimerVariant::CacheCleaning => {
+        self.timers.cache_cleaning.reset();
+        self.handle_cache_cleaning();
+      }
+      WriteTimerVariant::SendRepairData => {
+        let Some(timer) = core::mem::take(&mut self.timers.send_repair_data) else {
+          return;
+        };
+
+        //println!("sending repair data");
+
+        let reader_guid = timer.take_inner();
+
+        self.handle_repair_data_send(reader_guid, udp_sender, ring, domain_id);
+        if let Some(rp) = self.lookup_reader_proxy_mut(reader_guid) {
+          if rp.repair_mode {
+            let delay_to_next_repair = self
+              .qos_policies
+              .deadline()
+              .map_or_else(|| Duration::from_millis(10), |dl| dl.0)
+              / 5;
+
+            self.timers.set_send_repair_data(
+              self.my_guid.entity_id,
+              reader_guid,
+              delay_to_next_repair.into(),
+              domain_id,
+              ring,
+            );
           }
         }
-        TimedEvent::CacheCleaning => {
-          self.handle_cache_cleaning();
-        }
-        TimedEvent::SendRepairData {
-          to_reader: reader_guid,
-        } => {
-          self.handle_repair_data_send(reader_guid, udp_sender, ring, domain_id);
-          if let Some(rp) = self.lookup_reader_proxy_mut(reader_guid) {
-            if rp.repair_mode {
-              let delay_to_next_repair = self
-                .qos_policies
-                .deadline()
-                .map_or_else(|| Duration::from_millis(10), |dl| dl.0)
-                / 5;
+      }
+      WriteTimerVariant::SendRepairFrags => {
+        let Some(timer) = core::mem::take(&mut self.timers.send_repair_frags) else {
+          return;
+        };
 
-              use crate::io_uring::encoding::user_data::{self, WriteTimerVariant};
+        let reader_guid = timer.take_inner();
 
-              let timer = Timer::new_immediate_oneshot(reader_guid, std::time::Duration::from(delay_to_next_repair), None, ring, domain_id, user_data::Timer::Write(reader_guid.entity_id, WriteTimerVariant::SendRepairData)).unwrap();
+        self.handle_repair_frags_send(reader_guid, udp_sender, ring);
+        if let Some(rp) = self.lookup_reader_proxy_mut(reader_guid) {
+          if rp.repair_frags_requested() {
+            // more repair needed?
 
-              self.timed_event_timer.set_send_repair_data(timer);
-            }
-          }
-        }
-        TimedEvent::SendRepairFrags {
-          to_reader: reader_guid,
-        } => {
-          self.handle_repair_frags_send(reader_guid, udp_sender, ring);
-          if let Some(rp) = self.lookup_reader_proxy_mut(reader_guid) {
-            if rp.repair_frags_requested() {
-              // more repair needed?
+            use crate::io_uring::encoding::user_data::{self, WriteTimerVariant};
 
-              use crate::io_uring::encoding::user_data::{self, WriteTimerVariant};
+            let timer = Timer::new_immediate_oneshot(
+              reader_guid,
+              std::time::Duration::from(self.repairfrags_continue_delay),
+              None,
+              ring,
+              domain_id,
+              user_data::Timer::Write(reader_guid.entity_id, WriteTimerVariant::SendRepairFrags),
+            )
+            .unwrap();
 
-              let timer = Timer::new_immediate_oneshot(reader_guid, std::time::Duration::from(self.repairfrags_continue_delay), None, ring, domain_id, user_data::Timer::Write(reader_guid.entity_id, WriteTimerVariant::SendRepairFrags)).unwrap();
-
-              self.timed_event_timer.set_send_repair_frags(timer);
-            } // if
-          } // if let
-        } // SendRepairFrags
-      } // match
+            self.timers.set_send_repair_frags(timer);
+          } // if
+        } // if let
+      } // SendRepairFrags
+    } // match
   } // fn
 
   /// This is called by dp_wrapper every time cacheCleaning message is received.
@@ -517,116 +554,123 @@ impl Writer<timer_state::Init> {
   }
 
   // Receive new data samples from the DDS DataWriter
-  pub fn process_command(&mut self, udp_sender: &UDPSender, ring: &mut io_uring::IoUring, writer_cmd: WriterCommand) -> Option<bool> {
-      match writer_cmd {
-        WriterCommand::DDSData {
-          ddsdata: dds_data,
-          write_options,
-          sequence_number,
-        } => {
-          // Insert data to local HistoryBuffer
-          let timestamp =
-            self.insert_to_history_buffer(dds_data, write_options.clone(), sequence_number);
+  pub fn process_command(
+    &mut self,
+    udp_sender: &UDPSender,
+    ring: &mut io_uring::IoUring,
+    writer_cmd: WriterCommand,
+  ) -> Option<bool> {
+    match writer_cmd {
+      WriterCommand::DDSData {
+        ddsdata: dds_data,
+        write_options,
+        sequence_number,
+      } => {
+        // Insert data to local HistoryBuffer
+        let timestamp =
+          self.insert_to_history_buffer(dds_data, write_options.clone(), sequence_number);
 
-          // If not acting stateless-like, notify reader proxies that there is a new
-          // sample
-          if !self.like_stateless {
-            for reader in &mut self.readers.values_mut() {
-              reader.notify_new_cache_change(sequence_number);
+        // If not acting stateless-like, notify reader proxies that there is a new
+        // sample
+        if !self.like_stateless {
+          for reader in &mut self.readers.values_mut() {
+            reader.notify_new_cache_change(sequence_number);
 
-              // If the data is meant for a single reader only, set others as pending GAP for
-              // this sequence number.
-              if let Some(single_reader_guid) = write_options.to_single_reader() {
-                if reader.remote_reader_guid != single_reader_guid {
-                  reader.insert_pending_gap(sequence_number);
-                }
+            // If the data is meant for a single reader only, set others as pending GAP for
+            // this sequence number.
+            if let Some(single_reader_guid) = write_options.to_single_reader() {
+              if reader.remote_reader_guid != single_reader_guid {
+                reader.insert_pending_gap(sequence_number);
               }
             }
           }
-
-          if self.push_mode {
-            // Send data (DATA or DATAFRAGs) and a Heartbeat
-            if let Some(cc) = self.history_buffer.get_change(timestamp) {
-              let target_reader_opt = match write_options.to_single_reader() {
-                Some(guid) => self.readers.get(&guid), // Sending only to this reader
-                None => None,                          // Sending to all matched readers
-              };
-
-              let send_also_heartbeat = true;
-              self.send_cache_change(cc, send_also_heartbeat, target_reader_opt, udp_sender, ring);
-            } else {
-              error!("Lost the cache change that was just added?!");
-            }
-          } else {
-            // Send Heartbeat only.
-            // Readers will ask for the DATA with ACKNACK, if they are interested.
-            let final_flag = false; // false = request that readers acknowledge with ACKNACK.
-            let liveliness_flag = false; // This is not a manual liveliness assertion (DDS API call), but side-effect of
-            let hb_message = MessageBuilder::new()
-              .heartbeat_msg(
-                self.entity_id(), // from Writer
-                self.history_buffer.first_change_sequence_number(),
-                self.history_buffer.last_change_sequence_number(),
-                self.next_heartbeat_count(),
-                self.endianness,
-                EntityId::UNKNOWN, // to Reader
-                final_flag,
-                liveliness_flag,
-              )
-              .add_header_and_build(self.my_guid.prefix);
-            Self::send_message_to_readers(
-                self.endianness,
-              DeliveryMode::Multicast,
-              hb_message,
-              &mut self.readers.values(),
-              udp_sender,
-              ring,
-            );
-          }
-          None
         }
 
-        // WriterCommand::ResetOfferedDeadlineMissedStatus { writer_guid: _, } => {
-        //   self.reset_offered_deadline_missed_status();
-        // }
-        WriterCommand::WaitForAcknowledgments => {
-          if self.like_stateless {
-            error!(
-              "Attempted to wait for acknowledgements in a stateless Writer, which currently only \
-               supports BestEffort QoS. Ignoring. topic={:?}",
-              self.my_topic_name
-            );
-            return Some(true);
-          }
+        if self.push_mode {
+          // Send data (DATA or DATAFRAGs) and a Heartbeat
+          if let Some(cc) = self.history_buffer.get_change(timestamp) {
+            let target_reader_opt = match write_options.to_single_reader() {
+              Some(guid) => self.readers.get(&guid), // Sending only to this reader
+              None => None,                          // Sending to all matched readers
+            };
 
-          let wait_until = self.history_buffer.last_change_sequence_number();
-          let readers_pending: BTreeSet<_> = self
-            .readers
-            .iter()
-            .filter_map(|(guid, rp)| {
-              if rp.qos().is_reliable() && rp.all_acked_before <= wait_until {
-                Some(*guid)
-              } else {
-                None
-              }
-            })
-            .collect();
+            println!("{cc:?}, {target_reader_opt:?}");
 
-          let cond = readers_pending.is_empty();
-          self.ack_waiter = if cond {
-            // all acked already: try to signal app waiting at DataWriter
-            // but we ignore any failure to signal, if no-one is listening
-            None
+            let send_also_heartbeat = true;
+            self.send_cache_change(cc, send_also_heartbeat, target_reader_opt, udp_sender, ring);
           } else {
-            // Someone still needs to ack. Wait for them.
-            Some(AckWaiter {
-              wait_until,
-              readers_pending,
-            })
-          };
-          Some(cond)
+            error!("Lost the cache change that was just added?!");
+          }
+        } else {
+          // Send Heartbeat only.
+          // Readers will ask for the DATA with ACKNACK, if they are interested.
+          let final_flag = false; // false = request that readers acknowledge with ACKNACK.
+          let liveliness_flag = false; // This is not a manual liveliness assertion (DDS API call), but side-effect of
+          let hb_message = MessageBuilder::new()
+            .heartbeat_msg(
+              self.entity_id(), // from Writer
+              self.history_buffer.first_change_sequence_number(),
+              self.history_buffer.last_change_sequence_number(),
+              self.next_heartbeat_count(),
+              self.endianness,
+              EntityId::UNKNOWN, // to Reader
+              final_flag,
+              liveliness_flag,
+            )
+            .add_header_and_build(self.my_guid.prefix);
+          Self::send_message_to_readers(
+            self.endianness,
+            DeliveryMode::Multicast,
+            hb_message,
+            &mut self.readers.values(),
+            udp_sender,
+            ring,
+          );
         }
+        None
       }
+
+      // WriterCommand::ResetOfferedDeadlineMissedStatus { writer_guid: _, } => {
+      //   self.reset_offered_deadline_missed_status();
+      // }
+      WriterCommand::WaitForAcknowledgments => {
+        if self.like_stateless {
+          error!(
+            "Attempted to wait for acknowledgements in a stateless Writer, which currently only \
+               supports BestEffort QoS. Ignoring. topic={:?}",
+            self.my_topic_name
+          );
+          return Some(true);
+        }
+
+        let wait_until = self.history_buffer.last_change_sequence_number();
+        let readers_pending: BTreeSet<_> = self
+          .readers
+          .iter()
+          .filter_map(|(guid, rp)| {
+            if rp.qos().is_reliable() && rp.all_acked_before <= wait_until {
+              Some(*guid)
+            } else {
+              None
+            }
+          })
+          .collect();
+
+        let cond = readers_pending.is_empty();
+        self.ack_waiter = if cond {
+          // all acked already: try to signal app waiting at DataWriter
+          // but we ignore any failure to signal, if no-one is listening
+          None
+        } else {
+          // Someone still needs to ack. Wait for them.
+          Some(AckWaiter {
+            wait_until,
+            readers_pending,
+          })
+        };
+        Some(cond)
+      }
+    }
   }
 
   // Returns a boolean telling if the data had to be fragmented
@@ -673,6 +717,8 @@ impl Writer<timer_state::Init> {
     let reader_entity_id =
       target_reader_opt.map_or(EntityId::UNKNOWN, |p| p.remote_reader_guid.entity_id);
 
+    println!("\nreader entity id: {reader_entity_id:?}\n");
+
     let data_size = cc.data_value.payload_size();
     let fragmentation_needed = data_size > self.data_max_size_serialized;
 
@@ -717,7 +763,7 @@ impl Writer<timer_state::Init> {
         let liveliness_flag = false; // This is not a manual liveliness assertion (DDS API call), but side-effect of
                                      // writing new data.
         message_builder = message_builder.heartbeat_msg(
-          self.entity_id(), // from Writer
+          self.entity_id(),
           self.history_buffer.first_change_sequence_number(),
           self.history_buffer.last_change_sequence_number(),
           self.next_heartbeat_count(),
@@ -729,6 +775,8 @@ impl Writer<timer_state::Init> {
       }
 
       let data_message = message_builder.add_header_and_build(self.my_guid.prefix);
+
+      println!("msg: {data_message:?}");
 
       messages_to_send.push(data_message);
     } else {
@@ -804,17 +852,27 @@ impl Writer<timer_state::Init> {
       }
     }
 
+    //println!("msgs: {messages_to_send:?}");
+
     // Send the messages, either to all readers or just one
     for msg in messages_to_send {
       match target_reader_opt {
         None => {
           // To all
-          Self::send_message_to_readers(self.endianness,DeliveryMode::Multicast, msg, &mut self.readers.values(), udp_sender, ring);
+          println!("sending to {:?}", self.readers);
+          Self::send_message_to_readers(
+            self.endianness,
+            DeliveryMode::Multicast,
+            msg,
+            &mut self.readers.values(),
+            udp_sender,
+            ring,
+          );
         }
         Some(reader_proxy) => {
           // To one
           Self::send_message_to_readers(
-              self.endianness,
+            self.endianness,
             DeliveryMode::Unicast,
             msg,
             &mut std::iter::once(reader_proxy),
@@ -855,7 +913,12 @@ impl Writer<timer_state::Init> {
   // --------------------------------------------------------------
 
   /// This is called periodically.
-  pub fn handle_heartbeat_tick(&mut self, is_manual_assertion: bool, udp_sender: &UDPSender, ring: &mut io_uring::IoUring) {
+  pub fn handle_heartbeat_tick(
+    &mut self,
+    is_manual_assertion: bool,
+    udp_sender: &UDPSender,
+    ring: &mut io_uring::IoUring,
+  ) {
     if self.like_stateless {
       info!(
         "Ignoring handling heartbeat tick in a stateless-like Writer, since it currently supports \
@@ -878,11 +941,17 @@ impl Writer<timer_state::Init> {
     let first_change = self.history_buffer.first_change_sequence_number();
     let last_change = self.history_buffer.last_change_sequence_number();
 
+    /*
+    println!("readers: {:?}", self.readers);
+    println!("changes: {first_change:?}...{last_change:?}");
+    */
+
     if self
       .readers
       .values()
       .all(|rp| last_change < rp.all_acked_before)
     {
+      println!("data is all available");
       trace!("heartbeat tick: all readers have all available data.");
     } else {
       // the interface to .heartbeat_msg is silly: we give ref to ourself
@@ -891,8 +960,8 @@ impl Writer<timer_state::Init> {
         .ts_msg(self.endianness, Some(Timestamp::now()))
         .heartbeat_msg(
           self.entity_id(), // from Writer
-          self.history_buffer.first_change_sequence_number(),
-          self.history_buffer.last_change_sequence_number(),
+          first_change,
+          last_change,
           self.next_heartbeat_count(),
           self.endianness,
           EntityId::UNKNOWN, // to Reader
@@ -909,34 +978,15 @@ impl Writer<timer_state::Init> {
         last_change,
       );
 
-      // In the volatile key exchange topic we cannot send to multiple readers by any
-      // means, so we handle that separately.
-      if self.entity_id() == EntityId::P2P_BUILTIN_PARTICIPANT_VOLATILE_SECURE_WRITER {
-        for rp in self.readers.values() {
-          if last_change < rp.all_acked_before {
-            // Everything we have has been acknowledged already. Do nothing.
-          } else {
-            Self::send_message_to_readers(
-                self.endianness,
-              DeliveryMode::Unicast,
-              hb_message.clone(),
-              &mut std::iter::once(rp),
-              udp_sender,
-              ring,
-            );
-          }
-        }
-      } else {
-        // Normal case
-        Self::send_message_to_readers(
-            self.endianness,
-          DeliveryMode::Multicast,
-          hb_message,
-          &mut self.readers.values(),
-          udp_sender,
-          ring,
-        );
-      }
+      //println!("sending msg to readers");
+      Self::send_message_to_readers(
+        self.endianness,
+        DeliveryMode::Multicast,
+        hb_message,
+        &mut self.readers.values(),
+        udp_sender,
+        ring,
+      );
     }
   }
 
@@ -1044,13 +1094,13 @@ impl Writer<timer_state::Init> {
             reader_proxy.repair_mode = true; // TODO: Is this correct? Do we need to repair immediately?
                                              // set repair timer to fire
 
-
-
-              use crate::io_uring::encoding::user_data::{self, WriteTimerVariant};
-
-            let timer = Timer::new_immediate_oneshot(reader_guid, self.nack_response_delay, None, ring, domain_id, user_data::Timer::Write(reader_guid.entity_id, WriteTimerVariant::SendRepairData)).unwrap();
-
-            self.timed_event_timer.set_send_repair_data(timer);
+            self.timers.set_send_repair_data(
+              self.my_guid.entity_id,
+              reader_guid,
+              self.nack_response_delay.into(),
+              domain_id,
+              ring,
+            );
           }
         } // if have reader_proxy
 
@@ -1066,7 +1116,7 @@ impl Writer<timer_state::Init> {
               )
               .add_header_and_build(self.my_guid.prefix);
             Self::send_message_to_readers(
-                self.endianness,
+              self.endianness,
               DeliveryMode::Unicast,
               gap_message,
               &mut std::iter::once(reader_proxy),
@@ -1086,9 +1136,17 @@ impl Writer<timer_state::Init> {
 
         use crate::io_uring::encoding::user_data::{self, WriteTimerVariant};
 
-        let timer = Timer::new_immediate_oneshot(reader_guid, self.nackfrag_response_delay, None, ring, domain_id, user_data::Timer::Write(reader_guid.entity_id, WriteTimerVariant::SendRepairFrags)).unwrap();
+        let timer = Timer::new_immediate_oneshot(
+          reader_guid,
+          self.nackfrag_response_delay,
+          None,
+          ring,
+          domain_id,
+          user_data::Timer::Write(reader_guid.entity_id, WriteTimerVariant::SendRepairFrags),
+        )
+        .unwrap();
 
-        self.timed_event_timer.set_send_repair_frags(timer);
+        self.timers.set_send_repair_frags(timer);
       }
     }
   }
@@ -1105,7 +1163,13 @@ impl Writer<timer_state::Init> {
 
   // Send out missing data
 
-  fn handle_repair_data_send(&mut self, to_reader: GUID, udp_sender: &UDPSender, ring: &mut io_uring::IoUring, domain_id: u16) {
+  fn handle_repair_data_send(
+    &mut self,
+    to_reader: GUID,
+    udp_sender: &UDPSender,
+    ring: &mut io_uring::IoUring,
+    domain_id: u16,
+  ) {
     if self.like_stateless {
       warn!(
         "Not sending repair data in a stateless-like Writer, since it currently supports only \
@@ -1133,7 +1197,12 @@ impl Writer<timer_state::Init> {
     }
   }
 
-  fn handle_repair_frags_send(&mut self, to_reader: GUID, udp_sender: &UDPSender, ring: &mut io_uring::IoUring) {
+  fn handle_repair_frags_send(
+    &mut self,
+    to_reader: GUID,
+    udp_sender: &UDPSender,
+    ring: &mut io_uring::IoUring,
+  ) {
     if self.like_stateless {
       warn!(
         "Not sending repair frags in a stateless-like Writer, since it currently supports only \
@@ -1156,7 +1225,13 @@ impl Writer<timer_state::Init> {
     }
   }
 
-  fn handle_repair_data_send_worker(&mut self, reader_proxy: &mut RtpsReaderProxy, udp_sender: &UDPSender, ring: &mut io_uring::IoUring, domain_id: u16) {
+  fn handle_repair_data_send_worker(
+    &mut self,
+    reader_proxy: &mut RtpsReaderProxy,
+    udp_sender: &UDPSender,
+    ring: &mut io_uring::IoUring,
+    domain_id: u16,
+  ) {
     // Note: The reader_proxy is now removed from readers map
     let reader_guid = reader_proxy.remote_reader_guid;
 
@@ -1199,7 +1274,8 @@ impl Writer<timer_state::Init> {
           // // DEBUG
 
           // The cache change was found. Send it to the reader
-          let data_was_fragmented = self.send_cache_change(cc, false, Some(reader_proxy), udp_sender, ring);
+          let data_was_fragmented =
+            self.send_cache_change(cc, false, Some(reader_proxy), udp_sender, ring);
 
           if data_was_fragmented {
             // Mark the reader as having requested all frags
@@ -1209,11 +1285,18 @@ impl Writer<timer_state::Init> {
 
             // Set a timer to send repair frags if needed
 
-
             use crate::io_uring::encoding::user_data::{self, WriteTimerVariant};
 
-            let timer = Timer::new_immediate_oneshot(reader_guid, self.repairfrags_continue_delay, None, ring, domain_id, user_data::Timer::Write(reader_guid.entity_id, WriteTimerVariant::SendRepairFrags)).unwrap();
-            self.timed_event_timer.set_send_repair_frags(timer);
+            let timer = Timer::new_immediate_oneshot(
+              reader_guid,
+              self.repairfrags_continue_delay,
+              None,
+              ring,
+              domain_id,
+              user_data::Timer::Write(reader_guid.entity_id, WriteTimerVariant::SendRepairFrags),
+            )
+            .unwrap();
+            self.timers.set_send_repair_frags(timer);
           }
           // mark as sent
           reader_proxy.mark_change_sent(unsent_sn);
@@ -1262,7 +1345,7 @@ impl Writer<timer_state::Init> {
         let gap_msg = gap_msg.add_header_and_build(self.my_guid.prefix);
 
         Self::send_message_to_readers(
-            self.endianness,
+          self.endianness,
           DeliveryMode::Unicast,
           gap_msg,
           &mut std::iter::once(&*reader_proxy),
@@ -1330,7 +1413,7 @@ impl Writer<timer_state::Init> {
 
         // TODO: some sort of queuing is needed
         Self::send_message_to_readers(
-            self.endianness,
+          self.endianness,
           DeliveryMode::Unicast,
           message_builder.add_header_and_build(self.my_guid.prefix),
           &mut std::iter::once(&*reader_proxy),
@@ -1491,6 +1574,7 @@ impl Writer<timer_state::Init> {
         macro_rules! send_unless_sent_and_mark {
           ($locs:expr) => {
             for loc in $locs.iter() {
+              //println!("sending to {loc:?}");
               if already_sent_to.contains(loc) {
                 trace!("Already sent to {:?}", loc);
               } else {
@@ -1557,6 +1641,10 @@ impl Writer<timer_state::Init> {
     &mut self,
     reader_proxy: &RtpsReaderProxy,
     requested_qos: &QosPolicies,
+    /*
+    udp_sender: &UDPSender,
+    ring: &mut IoUring,
+    */
   ) -> Option<(DataWriterStatus, DomainParticipantStatusEvent)> {
     debug!("update_reader_proxy topic={:?}", self.my_topic_name);
     match self.qos_policies.compliance_failure_wrt(requested_qos) {
@@ -1565,8 +1653,6 @@ impl Writer<timer_state::Init> {
         let change = self.matched_reader_update(reader_proxy);
         if change > 0 {
           self.matched_readers_count_total += change;
-
-
 
           let writer_status = DataWriterStatus::PublicationMatched {
             total: CountWithChange::new(self.matched_readers_count_total, change),
@@ -1578,6 +1664,11 @@ impl Writer<timer_state::Init> {
             local_writer: self.my_guid,
             remote_reader: reader_proxy.remote_reader_guid,
           };
+
+          /*
+          self.handle_heartbeat_tick(false, udp_sender, ring);
+          */
+
           // If we're reliable, should we send out a heartbeat so that new reader can
           // catch up?
           info!(
@@ -1588,7 +1679,7 @@ impl Writer<timer_state::Init> {
           debug!("Reader details: {:?}", &reader_proxy);
           Some((writer_status, participant_status))
         } else {
-            None
+          None
         }
       }
       Some(bad_policy_id) => {
@@ -1683,7 +1774,7 @@ impl Writer<timer_state::Init> {
         reader: guid,
       })
     } else {
-        None
+      None
     };
     // also remember to remove reader from ack_waiter
     self.update_ack_waiters(guid, None);
@@ -1699,7 +1790,7 @@ impl Writer<timer_state::Init> {
       .map(|(g, _)| *g)
       .collect();
 
-      LostReaders::new(self, lost_readers)
+    LostReaders::new(self, lost_readers)
   }
 
   fn lookup_reader_proxy_mut(&mut self, guid: GUID) -> Option<&mut RtpsReaderProxy> {
@@ -1728,32 +1819,31 @@ impl Writer<timer_state::Init> {
 }
 
 pub struct LostReaders<'a> {
-    writer: &'a mut Writer<timer_state::Init>,
-    iter: std::vec::IntoIter<GUID>,
+  writer: &'a mut Writer<timer_state::Init>,
+  iter: std::vec::IntoIter<GUID>,
 }
 
-impl <'a> LostReaders<'a> {
-    fn new(writer: &'a mut Writer<timer_state::Init>, readers: Vec<GUID>) -> Self {
-        Self {
-            writer,
-            iter: readers.into_iter(),
-        }
+impl<'a> LostReaders<'a> {
+  fn new(writer: &'a mut Writer<timer_state::Init>, readers: Vec<GUID>) -> Self {
+    Self {
+      writer,
+      iter: readers.into_iter(),
     }
+  }
 }
 
 impl Iterator for LostReaders<'_> {
-    type Item = (DataWriterStatus, GUID);
+  type Item = (DataWriterStatus, GUID);
 
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some(next) = self.iter.next() {
-            if let Some(lost) = self.writer.reader_lost(next) {
-                return Some((lost, next));
-            }
-        }
-        None
+  fn next(&mut self) -> Option<Self::Item> {
+    while let Some(next) = self.iter.next() {
+      if let Some(lost) = self.writer.reader_lost(next) {
+        return Some((lost, next));
+      }
     }
+    None
+  }
 }
-
 
 impl RTPSEntity for Writer<timer_state::Init> {
   fn guid(&self) -> GUID {
@@ -1838,4 +1928,3 @@ mod tests {
     info!("writerResult:  {:?}", write_result);
   }
 }
-

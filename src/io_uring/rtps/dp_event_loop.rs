@@ -1,340 +1,525 @@
-
-//this can probably be moved in with discovery.
-
 use crate::io_uring::timer::{timer_state, Timer};
 use std::collections::BTreeMap;
+use crate::io_uring::dds::DDSCache;
+use crate::TopicCache;
 
 struct Timers<T> {
-    acknack: Timer<(), T>,
-    cache_gc: Timer<(), T>,
+  acknack: Timer<(), T>,
+  cache_gc: Timer<(), T>,
 }
 
 impl Timers<timer_state::Uninit> {
-    fn new() -> Self {
-        let acknack = Timer::new_periodic((), PREEMPTIVE_ACKNACK_PERIOD);
-        let cache_gc = Timer::new_periodic((), CACHE_CLEAN_PERIOD);
+  fn new() -> Self {
+    let acknack = Timer::new_periodic((), PREEMPTIVE_ACKNACK_PERIOD);
+    let cache_gc = Timer::new_periodic((), CACHE_CLEAN_PERIOD);
 
-        Self {
-            acknack,
-            cache_gc,
-        }
-    }
+    Self { acknack, cache_gc }
+  }
 
-    fn register(self, ring: &mut io_uring::IoUring, domain_id: u16) -> std::io::Result<Timers<timer_state::Init>> {
-        let Self {
-            acknack,
-            cache_gc,
-        } = self;
+  fn register(
+    self,
+    ring: &mut io_uring::IoUring,
+    domain_id: u16,
+  ) -> std::io::Result<Timers<timer_state::Init>> {
+    let Self { acknack, cache_gc } = self;
 
-        use crate::io_uring::encoding::user_data::{Timer, BuiltinTimerVariant};
+    use crate::io_uring::encoding::user_data::{Timer, BuiltinTimerVariant};
 
-        let acknack = acknack.register(ring, domain_id, Timer::Builtin(BuiltinTimerVariant::AckNack))?;
-        let cache_gc = cache_gc.register(ring, domain_id, Timer::Builtin(BuiltinTimerVariant::CacheCleaning))?;
+    let acknack = acknack.register(
+      ring,
+      domain_id,
+      Timer::Builtin(BuiltinTimerVariant::AckNack),
+    )?;
+    let cache_gc = cache_gc.register(
+      ring,
+      domain_id,
+      Timer::Builtin(BuiltinTimerVariant::CacheCleaning),
+    )?;
 
-        Ok(Timers {
-            acknack,
-            cache_gc,
-        })
-    }
+    Ok(Timers { acknack, cache_gc })
+  }
 }
 
 use crate::io_uring::discovery::traffic::UdpListeners;
 use crate::io_uring::discovery::{Discovery2, DiscoveryDB};
 
 pub struct Domain<TS, BS> {
-    domain_info: DomainInfo,
-    //dds_cache: Arc<RwLock<DDSCache>>,
-    //discovery_db: Arc<RwLock<DiscoveryDB>>,
+  pub(crate) domain_info: DomainInfo,
+  //dds_cache: Arc<RwLock<DDSCache>>,
+  //discovery_db: Arc<RwLock<DiscoveryDB>>,
+  message_receiver: MessageReceiver, // This contains our Readers
 
-    message_receiver: MessageReceiver, // This contains our Readers
+  timers: Timers<TS>,
+  pub(crate) listeners: UdpListeners<BS>,
 
-    timers: Timers<TS>,
-    listeners: UdpListeners<BS>,
+  // If security is enabled, this contains the security plugins
+  #[cfg(feature = "security")]
+  security_plugins_opt: Option<SecurityPluginsHandle>,
 
-    // If security is enabled, this contains the security plugins
-    #[cfg(feature = "security")]
-    security_plugins_opt: Option<SecurityPluginsHandle>,
-
-    writers: HashMap<EntityId, Writer<TS>>,
+  pub(crate) writers: HashMap<EntityId, Writer<TS>>,
 }
 
 use io_uring_buf_ring::buf_ring_state;
 
 impl Domain<timer_state::Uninit, buf_ring_state::Uninit> {
-    pub fn new(
-        domain_id: u16,
-        domain_participant_guid: GUID,
-        //dds_cache: Arc<RwLock<DDSCache>>,
-        //discovery_db: Arc<RwLock<DiscoveryDB>>,
+  pub fn new(
+    domain_id: u16,
+    domain_participant_guid: GUID,
+    //dds_cache: Arc<RwLock<DDSCache>>,
+    //discovery_db: Arc<RwLock<DiscoveryDB>>,
+    #[cfg(feature = "security")] security_plugins_opt: Option<SecurityPluginsHandle>,
 
-        #[cfg(feature = "security")]
-        security_plugins_opt: Option<SecurityPluginsHandle>,
+    writers: HashMap<EntityId, Writer<timer_state::Uninit>>,
+  ) -> crate::dds::CreateResult<Self> {
+    let (listeners, participant_id) = UdpListeners::try_new(domain_id)?;
+    let timers = Timers::new();
 
-        writers: HashMap<EntityId, Writer<timer_state::Uninit>>,
-    ) -> crate::dds::CreateResult<Self> {
-        let (listeners, participant_id) = UdpListeners::try_new(domain_id)?;
-        let timers = Timers::new();
+    let domain_info = DomainInfo {
+      domain_id,
+      participant_id,
+      domain_participant_guid,
+    };
 
-        let domain_info = DomainInfo {
-            domain_id,
-            participant_id,
-            domain_participant_guid,
-        };
+    let message_receiver = MessageReceiver::new(
+      domain_participant_guid.prefix,
+      #[cfg(feature = "security")]
+      security_plugins_opt.clone(),
+      #[cfg(not(feature = "security"))]
+      None,
+    );
 
-        let message_receiver = MessageReceiver::new(
-            domain_participant_guid.prefix,
-            #[cfg(feature = "security")]
-            security_plugins_opt.clone(),
-            #[cfg(not(feature = "security"))]
-            None,
-        );
+    Ok(Self {
+      domain_info,
+      //dds_cache,
+      //discovery_db,
+      message_receiver,
 
-        Ok(Self {
-            domain_info,
-            //dds_cache,
-            //discovery_db,
+      timers,
+      listeners,
 
-            message_receiver,
+      // If security is enabled, this contains the security plugins
+      #[cfg(feature = "security")]
+      security_plugins_opt,
 
-            timers,
-            listeners,
+      writers,
+    })
+  }
 
-            // If security is enabled, this contains the security plugins
-            #[cfg(feature = "security")]
-            security_plugins_opt,
+  pub fn register(
+    self,
+    ring: &mut io_uring::IoUring,
+    id: &mut u16,
+  ) -> std::io::Result<Domain<timer_state::Init, buf_ring_state::Init>> {
+    let Self {
+      domain_info,
+      message_receiver,
 
-            writers,
-        })
-    }
+      timers,
+      listeners,
 
-    pub fn register(self, ring: &mut io_uring::IoUring, id: &mut u16) -> std::io::Result<Domain<timer_state::Init, buf_ring_state::Init>> {
-        let Self {
-            domain_info,
-            message_receiver,
+      // If security is enabled, this contains the security plugins
+      #[cfg(feature = "security")]
+      security_plugins_opt,
 
-            timers,
-            listeners,
+      writers,
+    } = self;
 
-            // If security is enabled, this contains the security plugins
-            #[cfg(feature = "security")]
-            security_plugins_opt,
+    let writers = writers
+      .into_iter()
+      .map(|(id, w)| Ok((id, w.register(ring, domain_info.domain_id)?)))
+      .collect::<Result<_, std::io::Error>>()?;
 
-            writers,
-        } = self;
+    let listeners = listeners.register(ring, id, domain_info.domain_id)?;
+    let timers = timers.register(ring, domain_info.domain_id)?;
 
-        let writers = writers.into_iter().map(|(id, w)| Ok((id, w.register(ring, domain_info.domain_id)?))).collect::<Result<_, std::io::Error>>()?;
+    Ok(Domain {
+      domain_info,
+      //dds_cache,
+      //discovery_db,
+      message_receiver,
 
-        let listeners = listeners.register(ring, id, domain_info.domain_id)?;
-        let timers = timers.register(ring, domain_info.domain_id)?;
+      timers,
+      listeners,
 
-        Ok(Domain {
-            domain_info,
-            //dds_cache,
-            //discovery_db,
+      // If security is enabled, this contains the security plugins
+      #[cfg(feature = "security")]
+      security_plugins_opt,
 
-            message_receiver,
-
-            timers,
-            listeners,
-
-            // If security is enabled, this contains the security plugins
-            #[cfg(feature = "security")]
-            security_plugins_opt,
-
-            writers,
-        })
-    }
+      writers,
+    })
+  }
 }
 
 use crate::io_uring::rtps::PassedSubmessage;
 
 impl Domain<timer_state::Init, buf_ring_state::Init> {
-    pub fn handle_event(&mut self, ring: &mut io_uring::IoUring, discovery: &mut Discovery2<timer_state::Init>, discovery_db: &mut DiscoveryDB, udp_sender: &UDPSender, mut f: impl FnMut(DomainStatusEvent)) -> Option<()> {
-        use crate::io_uring::encoding::{UserData, user_data::*};
-        let entry = ring.completion().next()?;
-        let userdata = UserData::try_from(entry.user_data()).ok()?;
+  pub fn handle_event(
+    &mut self,
+    ring: &mut io_uring::IoUring,
+    discovery: &mut Discovery2<timer_state::Init>,
+    discovery_db: &mut DiscoveryDB,
+    udp_sender: &UDPSender,
+    dds_cache: &mut DDSCache,
+    mut f: impl FnMut(DomainRef<'_, '_>, DomainStatusEvent),
+    mut f2: impl FnMut(&str, &mut TopicCache),
+  ) -> Option<()> {
+    use crate::io_uring::encoding::{UserData, user_data::*};
+    let entry = ring.completion().next()?;
+    let userdata = UserData::try_from(entry.user_data()).ok()?;
 
-        match userdata.variant() {
-            Variant::DataRecv(udp_variant) => {
-                let buf_id = self.listeners.buffer_from_cqe(udp_variant, &entry).ok()??;
-                let buffer = buf_id.buffer();
-                let bytes = bytes::Bytes::copy_from_slice(buffer);
+    match userdata.variant() {
+      Variant::DataRecv(udp_variant) => {
+        let buf_id = self.listeners.buffer_from_cqe(udp_variant, &entry).ok()??;
+        let buffer = buf_id.buffer();
+        let bytes = bytes::Bytes::copy_from_slice(buffer);
 
-                let state = self.message_receiver.clone_partial_message_receiver_state();
-                drop(buf_id);
+        let state = self.message_receiver.clone_partial_message_receiver_state();
+        drop(buf_id);
 
-                let mut submsgs = self.message_receiver.handle_received_packet_2(&bytes)?;
-                while let Some(submsg) = submsgs.next() {
-                    let msg_recv = &mut *submsgs.msg_recv;
+        let mut submsgs = self.message_receiver.handle_received_packet_2(&bytes)?;
+        while let Some(submsg) = submsgs.next() {
+          let msg_recv = &mut *submsgs.msg_recv;
 
-                    match submsg {
-                        PassedSubmessage::Writer(msg) => {
-                            match discovery.handle_writer_msg(msg, &state, discovery_db, udp_sender, ring) {
-                                // builtin
-                                Ok(Some(mut changes)) => {
-                                    let mut state = None;
+          match submsg {
+            PassedSubmessage::Writer(msg) => {
+              match discovery.handle_writer_msg(msg, &state, discovery_db, udp_sender, ring) {
+                // builtin
+                Ok(Some(mut changes)) => {
+                  let mut state = None;
 
-                                    let readers = &mut msg_recv.available_readers;
+                  let readers = &mut msg_recv.available_readers;
 
-                                    let upd = DDIState::new(discovery, discovery_db, readers, &mut self.writers, &mut changes, &mut state, ring, udp_sender);
+                  let mut upd = DDIState::new(
+                    discovery,
+                    discovery_db,
+                    readers,
+                    &mut self.writers,
+                    &mut changes,
+                    &mut state,
+                    ring,
+                    udp_sender,
+                  );
 
-                                    for ev in upd {
-                                        println!("{ev:?}")
-                                    }
-                                }
-                                Ok(None) => return None,
-                                //not a builtin.
-                                Err(msg) => {
-                                    println!("missed writer: {msg:?}");
-                                }
+                  while let Some(ev) = upd.next() {
+                    match &ev {
+                      DomainStatusEvent::Data(status, guid)
+                      | DomainStatusEvent::Mixed(_, (status, guid)) => match status {
+                        DataStatus::Writer(status) => match status {
+                          DataWriterStatus::PublicationMatched { .. } => {
+                            println!("\npublication: {:?}\n", guid.entity_id);
+                            if let Some(writer) = upd.writers.get_mut(&guid.entity_id) {
+                              writer.handle_heartbeat_tick(false, upd.udp_sender, upd.ring);
+                              println!("sending inital heartbeat");
                             }
-                            // TODO: other messages. make it nested.
-                        }
-                        PassedSubmessage::Reader(m, source_guid_prefix) => {
-                            match discovery.handle_reader_submsg(m, source_guid_prefix) {
-                                // builtin
-                                Ok(_) => (),
-                                // not a builtin
-                                Err(msg) => {
-                                    println!("missed reader: {msg:?}");
-                                }
+                            /*
+                            if guid.entity_id.kind().is_user_defined() {
+                                let data = writer.write(msg.clone(), None).unwrap();
+                                data.write_to(&mut ctx);
+                                println!("sending data");
                             }
-                        }
+                            */
+                          }
+                          _ => (),
+                        },
+                        _ => (),
+                      },
+                      _ => (),
                     }
+
+                    /*
+                    match &ev {
+                      DomainStatusEvent::Data(DataStatus::Writer(DataWriterStatus::PublicationMatched {..}), guid) | DomainStatusEvent::Mixed(_, (DataStatus::Writer(DataWriterStatus::PublicationMatched {..}), guid)) => {
+                          if let Some(writer) = upd.writers.get_mut(&guid.entity_id) {
+                              writer.handle_heartbeat_tick(false, upd.udp_sender, upd.ring);
+                              println!("sending inital heartbeat");
+                          }
+                      }
+                      _ => (),
+                    }
+                    */
+
+                    f(
+                      DomainRef::new(upd.writers, upd.ring, upd.discovery, udp_sender),
+                      ev,
+                    );
+                  }
                 }
+                Ok(None) => return None,
+                //not a builtin.
+                Err(msg) => {
+                  // forgot to implement the message_receiver handle for working
+                  // with the rtps writers
+                  // TODO: implement line 361 onwards in
+                  // src/rtps/message_receiver.
+
+                  // handle writer submsg
+
+                  let receiver_entity_id = msg.receiver_entity_id();
+                  if matches!(receiver_entity_id, EntityId::UNKNOWN) {
+                    //println!("\nunknown: {msg:?}\n");
+                  }
+                  //if receiver_entity_id
+
+                  //
+
+                  //println!("user defined writer: {msg:?}");
+
+                  let recv_state = msg_recv.clone_partial_message_receiver_state();
+                  use crate::messages::submessages::submessage::HasEntityIds;
+                  let writer_entity_id = msg.sender_entity_id();
+                  let source_guid = GUID::new(recv_state.source_guid_prefix, writer_entity_id);
+
+                  let target_readers = msg_recv
+                    .available_readers
+                    .values_mut()
+                    .filter(|target_reader| target_reader.contains_writer(writer_entity_id));
+
+                  use crate::messages::submessages::submessages::WriterSubmessage;
+                  for reader in target_readers {
+                    let topic_cache = dds_cache
+                      .get_existing_topic_cache(&reader.topic_name)
+                      .expect("no topic cache for reader?");
+
+                    match &msg {
+                      WriterSubmessage::Data(data, flags) => {
+                        let changed = reader.handle_data_msg(
+                          data.clone(),
+                          flags.clone(),
+                          &recv_state,
+                          topic_cache,
+                        );
+                        if !changed {
+                          continue;
+                        }
+                        let topic = &reader.topic_name;
+                        f2(topic, topic_cache);
+                      }
+                      WriterSubmessage::Heartbeat(heartbeat, flags) => {
+                        use crate::messages::submessages::submessages::HEARTBEAT_Flags;
+                        reader.handle_heartbeat_msg(
+                          heartbeat,
+                          flags.contains(HEARTBEAT_Flags::Final),
+                          &recv_state,
+                          udp_sender,
+                          ring,
+                          topic_cache,
+                        );
+                      }
+                      WriterSubmessage::Gap(gap, _) => {
+                        reader.handle_gap_msg(gap, &recv_state, topic_cache);
+                      }
+                      WriterSubmessage::DataFrag(datafrag, flags) => {
+                        reader.handle_datafrag_msg(
+                          datafrag,
+                          flags.clone(),
+                          &recv_state,
+                          topic_cache,
+                        );
+                      }
+                      WriterSubmessage::HeartbeatFrag(heartbeatfrag, _) => {
+                        reader.handle_heartbeatfrag_msg(heartbeatfrag, &recv_state)
+                      }
+                    }
+                  }
+                }
+              }
+              // TODO: other messages. make it nested.
             }
-            Variant::Timer(timer) => match timer {
-                Timer::Builtin(b) => match b {
-                    // domain
-                    BuiltinTimerVariant::AckNack => {
-                        self.timers.acknack.reset();
-                        self.message_receiver.send_preemptive_acknacks(udp_sender, ring);
-                        discovery.caches.send_preemptive_acknacks(udp_sender, ring);
-                    }
-                    BuiltinTimerVariant::CacheCleaning => {
-                        self.timers.cache_gc.reset();
-                        discovery.caches.garbage_collect_cache();
-                        //TODO: garbaace collect DDS cache
-                    }
-                    // discovery
-                    BuiltinTimerVariant::ParticipantCleaning => {
-                        let mut cleanup = discovery.participant_cleanup(discovery_db);
-                        let readers = &mut self.message_receiver.available_readers;
-
-                        let mut state = None;
-
-                        let lost_cleanup = CleanupLostParticipant::new(discovery, readers, &mut self.writers, &mut cleanup, &mut state);
-
-                        for lost_participant in lost_cleanup {
-                            println!("lost in cleanup: {lost_participant:?}");
-                        }
-                    }
-                    BuiltinTimerVariant::TopicCleaning => {
-                        discovery.topic_cleanup(discovery_db);
-                    }
-                    BuiltinTimerVariant::SpdpPublish => {
-                        discovery.spdp_publish(self.domain_info.domain_participant_guid, &self.listeners, udp_sender, ring);
-                    }
-                    BuiltinTimerVariant::ParticipantMessages => {
-                        discovery.publish_participant_message(discovery_db, udp_sender, ring);
-                    }
+            PassedSubmessage::Reader(m, source_guid_prefix) => {
+              match discovery.handle_reader_submsg(m, source_guid_prefix, ring) {
+                // builtin
+                Ok(_) => (),
+                // not a builtin
+                Err(msg) => {
+                  //println!("reader: {m:?}, {source_guid_prefix:?}");
+                  println!("missed reader: {msg:?}");
                 }
-                t => {
-                    match discovery.caches.handle_timed_event(t, udp_sender, ring) {
-                        // builtin
-                        Ok(_) => (),
-                        // non builtin
-                        Err(e) => {
-                            println!("missed timer: {e:?}");
-                        }
-                    }
-                }
+              }
             }
+          }
         }
-        None
-    }
-
-    // returns if readers are pending
-  fn handle_writer_command(&mut self, entity_id: EntityId, event: crate::io_uring::rtps::writer::WriterCommand, udp_sender: &UDPSender, ring: &mut io_uring::IoUring) -> Option<impl Iterator<Item = EntityId> + use<'_>> {
-    if let Some(writer) = self.writers.get_mut(&entity_id) {
-        if matches!(writer.process_command(udp_sender, ring, event), None | Some(false)) {
-            Some(writer.local_readers())
-        } else {
-            // waiting for acknowledgements
-            // theres no change to update
-            None
-        }
-    } else {
-        None
-    }
-  }
-
-  fn handle_reader_command(&mut self, entity_id: EntityId, event: crate::dds::with_key::ReaderCommand) {
-      if let Some(reader) = self.message_receiver.reader_mut(entity_id) {
-          reader.process_command(event)
-      } else {
-        error!("Event for unknown reader {entity_id:?}");
       }
-  }
+      Variant::Timer(timer) => match timer {
+        Timer::Builtin(b) => match b {
+          // domain
+          BuiltinTimerVariant::AckNack => {
+            self.timers.acknack.reset();
+            self
+              .message_receiver
+              .send_preemptive_acknacks(udp_sender, ring);
+            discovery.caches.send_preemptive_acknacks(udp_sender, ring);
+          }
+          BuiltinTimerVariant::CacheCleaning => {
+            self.timers.cache_gc.reset();
+            discovery.caches.garbage_collect_cache();
+            dds_cache.garbage_collect();
+          }
+          // discovery
+          BuiltinTimerVariant::ParticipantCleaning => {
+            let mut cleanup = discovery.participant_cleanup(discovery_db);
+            let readers = &mut self.message_receiver.available_readers;
 
-  fn handle_writer_timed_event(&mut self, entity_id: EntityId, event: crate::rtps::writer::TimedEvent, udp_sender: &UDPSender, ring: &mut io_uring::IoUring) {
-    if let Some(writer) = self.writers.get_mut(&entity_id) {
-      writer.handle_timed_event(udp_sender, ring, event, self.domain_info.domain_id);
-    } else {
-      error!("Writer was not found with {:?}", entity_id);
-    }
-  }
+            let mut state = None;
 
-  fn handle_reader_timed_event(&mut self, entity_id: EntityId, event: crate::rtps::reader::TimedEvent) {
-    if let Some(reader) = self.message_receiver.reader_mut(entity_id) {
-      reader.handle_timed_event(event);
-    } else {
-      error!("Reader was not found with {:?}", entity_id);
-    }
-  }
+            let mut lost_cleanup = CleanupLostParticipant::new(
+              discovery,
+              readers,
+              &mut self.writers,
+              &mut cleanup,
+              &mut state,
+            );
 
-  fn handle_writer_acknack_action(&mut self, acknack_sender_prefix: GuidPrefix, acknack_submessage: &AckSubmessage, udp_sender: &UDPSender, ring: &mut io_uring::IoUring) {
-      let writer_guid = GUID::new_with_prefix_and_id(
-        self.domain_info.domain_participant_guid.prefix,
-        acknack_submessage.writer_id(),
-      );
-
-      if let Some(found_writer) = self.writers.get_mut(&writer_guid.entity_id) {
-        if found_writer.is_reliable() {
-          found_writer.handle_ack_nack(acknack_sender_prefix, &acknack_submessage, ring, udp_sender, self.domain_info.domain_id);
+            while let Some(lost_participant) = lost_cleanup.next() {
+              f(
+                DomainRef::new(
+                  lost_cleanup.writers,
+                  ring,
+                  lost_cleanup.discovery,
+                  udp_sender,
+                ),
+                lost_participant,
+              );
+            }
+          }
+          BuiltinTimerVariant::TopicCleaning => {
+            discovery.topic_cleanup(discovery_db);
+          }
+          BuiltinTimerVariant::SpdpPublish => {
+            discovery.spdp_publish(
+              self.domain_info.domain_participant_guid,
+              &self.listeners,
+              udp_sender,
+              ring,
+            );
+          }
+          BuiltinTimerVariant::ParticipantMessages => {
+            discovery.publish_participant_message(discovery_db, udp_sender, ring);
+          }
+        },
+        t => {
+          match discovery.caches.handle_timed_event(t, udp_sender, ring) {
+            // builtin
+            Ok(_) => (),
+            // non builtin
+            Err(e) => {
+              use crate::io_uring::encoding::user_data::Timer;
+              match t {
+                Timer::Write(entity_id, kind) => {
+                  if let Some(writer) = self.writers.get_mut(&entity_id) {
+                    writer.handle_timed_event(udp_sender, ring, kind, self.domain_info.domain_id);
+                  }
+                }
+                Timer::Read(entity_id, kind) => {}
+                _ => unreachable!(),
+              }
+            }
+          }
         }
+      },
+    }
+    None
+  }
+
+  // returns if readers are pending
+  pub(crate) fn handle_writer_command(
+    &mut self,
+    entity_id: EntityId,
+    event: crate::io_uring::rtps::writer::WriterCommand,
+    udp_sender: &UDPSender,
+    ring: &mut io_uring::IoUring,
+  ) -> Option<impl Iterator<Item = EntityId> + use<'_>> {
+    if let Some(writer) = self.writers.get_mut(&entity_id) {
+      if matches!(
+        writer.process_command(udp_sender, ring, event),
+        None | Some(false)
+      ) {
+        Some(writer.local_readers())
       } else {
-        // Note: when testing against FastDDS Shapes demo, this else branch is
-        // repeatedly triggered. The resulting log entry contains the following
-        // EntityId: {[0, 3, 0] EntityKind::WRITER_NO_KEY_BUILT_IN}.
-        // In this case a writer cannot be found, because FastDDS sends
-        // pre-emptive acknacks about a built-in topic defined in DDS Xtypes
-        // specification, which RustDDS does not implement. So even though the acknack
-        // cannot be handled, it is not a problem in this case.
-        debug!(
-          "Couldn't handle acknack/nackfrag! Did not find local RTPS writer with GUID: {:x?}",
-          writer_guid
+        // waiting for acknowledgements
+        // theres no change to update
+        None
+      }
+    } else {
+      None
+    }
+  }
+
+  fn handle_reader_command(
+    &mut self,
+    entity_id: EntityId,
+    event: crate::dds::with_key::ReaderCommand,
+  ) {
+    if let Some(reader) = self.message_receiver.reader_mut(entity_id) {
+      reader.process_command(event)
+    } else {
+      error!("Event for unknown reader {entity_id:?}");
+    }
+  }
+
+  fn handle_writer_acknack_action(
+    &mut self,
+    acknack_sender_prefix: GuidPrefix,
+    acknack_submessage: &AckSubmessage,
+    udp_sender: &UDPSender,
+    ring: &mut io_uring::IoUring,
+  ) {
+    let writer_guid = GUID::new_with_prefix_and_id(
+      self.domain_info.domain_participant_guid.prefix,
+      acknack_submessage.writer_id(),
+    );
+
+    if let Some(found_writer) = self.writers.get_mut(&writer_guid.entity_id) {
+      if found_writer.is_reliable() {
+        found_writer.handle_ack_nack(
+          acknack_sender_prefix,
+          &acknack_submessage,
+          ring,
+          udp_sender,
+          self.domain_info.domain_id,
         );
       }
+    } else {
+      // Note: when testing against FastDDS Shapes demo, this else branch is
+      // repeatedly triggered. The resulting log entry contains the following
+      // EntityId: {[0, 3, 0] EntityKind::WRITER_NO_KEY_BUILT_IN}.
+      // In this case a writer cannot be found, because FastDDS sends
+      // pre-emptive acknacks about a built-in topic defined in DDS Xtypes
+      // specification, which RustDDS does not implement. So even though the acknack
+      // cannot be handled, it is not a problem in this case.
+      debug!(
+        "Couldn't handle acknack/nackfrag! Did not find local RTPS writer with GUID: {:x?}",
+        writer_guid
+      );
+    }
   }
 
   fn remote_reader_lost(&mut self, reader_guid: GUID) -> LostReaderUpdates<'_> {
-      Self::remote_reader_lost_inner(&mut self.writers, reader_guid)
+    Self::remote_reader_lost_inner(&mut self.writers, reader_guid)
   }
 
-  fn remote_reader_lost_inner(writers: &mut HashMap<EntityId, Writer<timer_state::Init>>, reader_guid: GUID) -> LostReaderUpdates<'_> {
+  fn remote_reader_lost_inner(
+    writers: &mut HashMap<EntityId, Writer<timer_state::Init>>,
+    reader_guid: GUID,
+  ) -> LostReaderUpdates<'_> {
     LostReaderUpdates::new(writers.values_mut(), reader_guid)
   }
 
   fn remote_writer_lost(&mut self, writer_guid: GUID) -> LostWriterUpdates<'_> {
-      Self::remote_writer_lost_inner(&mut self.message_receiver.available_readers, writer_guid)
+    Self::remote_writer_lost_inner(&mut self.message_receiver.available_readers, writer_guid)
   }
 
-  fn remote_writer_lost_inner(readers: &mut BTreeMap<EntityId, Reader<timer_state::Init>>, writer_guid: GUID) -> LostWriterUpdates<'_> {
+  fn remote_writer_lost_inner(
+    readers: &mut BTreeMap<EntityId, Reader<timer_state::Init>>,
+    writer_guid: GUID,
+  ) -> LostWriterUpdates<'_> {
     LostWriterUpdates::new(readers.values_mut(), writer_guid)
   }
 
-  fn add_local_reader(&mut self, reader_ing: ReaderIngredients, ring: &mut io_uring::IoUring) -> std::io::Result<()> {
+  pub(crate) fn add_local_reader(
+    &mut self,
+    reader_ing: ReaderIngredients,
+    ring: &mut io_uring::IoUring,
+  ) -> std::io::Result<()> {
     let domain_id = self.domain_info.domain_id;
 
     let new_reader = Reader::new(reader_ing).register(ring, domain_id)?;
@@ -360,17 +545,23 @@ impl Domain<timer_state::Init, buf_ring_state::Init> {
     }
   }
 
-  fn add_local_writer(&mut self, writer_ing: WriterIngredients, ring: &mut io_uring::IoUring) -> std::io::Result<()> {
+  pub(crate) fn add_local_writer(
+    &mut self,
+    writer_ing: WriterIngredients,
+    ring: &mut io_uring::IoUring,
+  ) -> std::io::Result<()> {
     let entity_id = writer_ing.guid.entity_id;
     let domain_id = self.domain_info.domain_id;
 
-    let new_writer = Writer::new(writer_ing).register(ring, domain_id)?;
+    let mut new_writer = Writer::new(writer_ing).register(ring, domain_id)?;
+
+    //new_writer.handle_heartbeat_tick()
 
     self.writers.insert(entity_id, new_writer);
     Ok(())
   }
 
-  fn remove_local_writer(&mut self, writer_guid: &GUID) {
+  pub(crate) fn remove_local_writer(&mut self, writer_guid: &GUID) {
     if let Some(_) = self.writers.remove(&writer_guid.entity_id) {
       #[cfg(feature = "security")]
       if let Some(plugins_handle) = self.security_plugins_opt.as_ref() {
@@ -382,13 +573,12 @@ impl Domain<timer_state::Init, buf_ring_state::Init> {
           .get_plugins()
           .unregister_local_writer(writer_guid);
       }
-
     }
   }
 
   #[cfg(feature = "security")]
   fn on_remote_participant_authentication_status_changed(&mut self, remote_guidp: GuidPrefix) {
-      //TODO
+    //TODO
     let auth_status = discovery_db_read(&self.discovery_db).get_authentication_status(remote_guidp);
 
     auth_status.map(|status| {
@@ -402,7 +592,7 @@ impl Domain<timer_state::Init, buf_ring_state::Init> {
       Some(AuthenticationStatus::Authenticated) => {
         // The participant has been authenticated
         // First connect the built-in endpoints
-        self.update_participant(remote_guidp, |_,_| (), |_,_| ());
+        self.update_participant(remote_guidp, |_, _| (), |_, _| ());
         // Then start the key exchange
         if let Err(e) = self.discovery_command_sender.send(
           DiscoveryCommand::StartKeyExchangeWithRemoteParticipant {
@@ -418,7 +608,7 @@ impl Domain<timer_state::Init, buf_ring_state::Init> {
       }
       Some(AuthenticationStatus::Authenticating) => {
         // The following call should connect the endpoints used for authentication
-        self.update_participant(remote_guidp, |_,_| (), |_,_| ());
+        self.update_participant(remote_guidp, |_, _| (), |_, _| ());
       }
       Some(AuthenticationStatus::Rejected) => {
         // TODO: disconnect endpoints from the participant?
@@ -437,341 +627,494 @@ impl Domain<timer_state::Init, buf_ring_state::Init> {
   }
 }
 
-use crate::io_uring::discovery::{Caches, Cache, DiscoveredKind};
-
-use crate::discovery::{ DiscoveredTopicData, SpdpDiscoveredParticipantData, ParticipantMessageData };
-
-struct Builtins<'a> {
-    publications: Option<&'a mut Cache<DiscoveredWriterData, timer_state::Init>>,
-    topics: Option<&'a mut Cache<DiscoveredTopicData, timer_state::Init>>,
-    participants: Option<&'a mut Cache<SpdpDiscoveredParticipantData, timer_state::Init>>,
-    subscriptions: Option<&'a mut Cache<DiscoveredReaderData, timer_state::Init>>,
-    participant_messages: Option<&'a mut Cache<ParticipantMessageData, timer_state::Init>>,
+pub struct DomainRef<'a, 'b> {
+  pub(crate) writers: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
+  pub(crate) ring: &'b mut IoUring,
+  pub(crate) discovery: &'b mut Discovery2<timer_state::Init>,
+  pub(crate) udp_sender: &'b UDPSender,
 }
 
-impl <'a> Builtins<'a> {
-    fn new(caches: &'a mut Caches<timer_state::Init>) -> Self {
-        Self {
-            publications: Some(&mut caches.publications),
-            topics: Some(&mut caches.topics),
-            participants: Some(&mut caches.participants),
-            subscriptions: Some(&mut caches.subscriptions),
-            participant_messages: Some(&mut caches.participant_messages),
-        }
+impl<'a, 'b> DomainRef<'a, 'b> {
+  fn new(
+    writers: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
+    ring: &'b mut IoUring,
+    discovery: &'b mut Discovery2<timer_state::Init>,
+    udp_sender: &'b UDPSender,
+  ) -> Self {
+    Self {
+      writers,
+      ring,
+      discovery,
+      udp_sender,
     }
+  }
+}
+
+use crate::io_uring::discovery::{Caches, Cache, DiscoveredKind};
+
+use crate::discovery::{DiscoveredTopicData, SpdpDiscoveredParticipantData, ParticipantMessageData};
+
+struct Builtins<'a> {
+  publications: Option<&'a mut Cache<DiscoveredWriterData, timer_state::Init>>,
+  topics: Option<&'a mut Cache<DiscoveredTopicData, timer_state::Init>>,
+  participants: Option<&'a mut Cache<SpdpDiscoveredParticipantData, timer_state::Init>>,
+  subscriptions: Option<&'a mut Cache<DiscoveredReaderData, timer_state::Init>>,
+  participant_messages: Option<&'a mut Cache<ParticipantMessageData, timer_state::Init>>,
+}
+
+impl<'a> Builtins<'a> {
+  fn new(caches: &'a mut Caches<timer_state::Init>) -> Self {
+    Self {
+      publications: Some(&mut caches.publications),
+      topics: Some(&mut caches.topics),
+      participants: Some(&mut caches.participants),
+      subscriptions: Some(&mut caches.subscriptions),
+      participant_messages: Some(&mut caches.participant_messages),
+    }
+  }
 }
 
 struct UpdatedParticipant2<'a> {
-    builtins: Builtins<'a>,
-    writers_list: vec::IntoIter<(EntityId, EntityId, u32)>,
-    readers_list: vec::IntoIter<(EntityId, EntityId, u32)>,
+  builtins: Builtins<'a>,
+  writers_list: vec::IntoIter<(EntityId, EntityId, u32)>,
+  readers_list: vec::IntoIter<(EntityId, EntityId, u32)>,
+  discovered_participant: crate::discovery::SpdpDiscoveredParticipantData,
+}
+
+impl<'a> UpdatedParticipant2<'a> {
+  fn new(
+    caches: &'a mut Caches<timer_state::Init>,
     discovered_participant: crate::discovery::SpdpDiscoveredParticipantData,
+  ) -> Self {
+    let builtins = Builtins::new(caches);
+    let writers_list = crate::rtps::constant::STANDARD_BUILTIN_WRITERS_INIT_LIST
+      .to_vec()
+      .into_iter();
+    let readers_list = crate::rtps::constant::STANDARD_BUILTIN_READERS_INIT_LIST
+      .to_vec()
+      .into_iter();
+
+    Self {
+      builtins,
+      writers_list,
+      readers_list,
+      discovered_participant,
+    }
+  }
 }
 
-impl <'a> UpdatedParticipant2<'a> {
-    fn new(
-        caches: &'a mut Caches<timer_state::Init>,
-        discovered_participant: crate::discovery::SpdpDiscoveredParticipantData
-    ) -> Self {
-        let builtins = Builtins::new(caches);
-        let writers_list = crate::rtps::constant::STANDARD_BUILTIN_WRITERS_INIT_LIST.to_vec().into_iter();
-        let readers_list = crate::rtps::constant::STANDARD_BUILTIN_READERS_INIT_LIST.to_vec().into_iter();
+impl<'a> Iterator for UpdatedParticipant2<'a> {
+  type Item = DomainStatusEvent;
 
-        Self {
-            builtins,
-            writers_list,
-            readers_list,
-            discovered_participant,
+  fn next(&mut self) -> Option<Self::Item> {
+    while let Some((writer_eid, reader_eid, endpoint)) = self.readers_list.next() {
+      if !self
+        .discovered_participant
+        .available_builtin_endpoints
+        .contains(endpoint)
+      {
+        continue;
+      }
+
+      let reader_proxy = self
+        .discovered_participant
+        .as_reader_proxy(true, Some(reader_eid));
+
+      let (upd, guid) = match (writer_eid, &mut self.builtins) {
+        (
+          EntityId::SEDP_BUILTIN_PUBLICATIONS_WRITER,
+          Builtins {
+            publications: Some(cache),
+            ..
+          },
+        ) => (cache.update_reader_proxy(&reader_proxy), cache.writer_guid),
+        (
+          EntityId::SEDP_BUILTIN_TOPIC_WRITER,
+          Builtins {
+            topics: Some(cache),
+            ..
+          },
+        ) => (cache.update_reader_proxy(&reader_proxy), cache.writer_guid),
+        (
+          EntityId::SPDP_BUILTIN_PARTICIPANT_WRITER,
+          Builtins {
+            participants: Some(cache),
+            ..
+          },
+        ) => (cache.update_reader_proxy(&reader_proxy), cache.writer_guid),
+        (
+          EntityId::SEDP_BUILTIN_SUBSCRIPTIONS_WRITER,
+          Builtins {
+            subscriptions: Some(cache),
+            ..
+          },
+        ) => (cache.update_reader_proxy(&reader_proxy), cache.writer_guid),
+        (
+          EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_WRITER,
+          Builtins {
+            participant_messages: Some(cache),
+            ..
+          },
+        ) => {
+          let qos = &cache.qos;
+          let upd = if self
+            .discovered_participant
+            .builtin_endpoint_qos
+            .is_some_and(|epq| epq.is_best_effort())
+          {
+            let mut qos = qos.clone();
+            qos.reliability = Some(policy::Reliability::BestEffort);
+            cache.update_reader_proxy_with_qos(&reader_proxy, &qos)
+          } else {
+            cache.update_reader_proxy(&reader_proxy)
+          };
+          (upd, cache.writer_guid)
         }
+        _ => continue,
+      };
+
+      if let Some((writer, domain)) = upd {
+        return Some(DomainStatusEvent::Mixed(
+          domain,
+          (DataStatus::Writer(writer), guid),
+        ));
+      } else {
+        continue;
+      }
     }
-}
 
-impl <'a> Iterator for UpdatedParticipant2<'a> {
-    type Item = DomainStatusEvent;
+    while let Some((writer_eid, reader_eid, endpoint)) = self.writers_list.next() {
+      if !self
+        .discovered_participant
+        .available_builtin_endpoints
+        .contains(endpoint)
+      {
+        continue;
+      }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some((writer_eid, reader_eid, endpoint)) = self.readers_list.next() {
-            if !self.discovered_participant.available_builtin_endpoints.contains(endpoint) {
-                continue;
-            }
+      let writer_proxy = self
+        .discovered_participant
+        .as_writer_proxy(true, Some(writer_eid));
 
-            let reader_proxy = self.discovered_participant.as_reader_proxy(true, Some(reader_eid));
+      let (upd, guid) = match (reader_eid, &mut self.builtins) {
+        (
+          EntityId::SEDP_BUILTIN_PUBLICATIONS_READER,
+          Builtins {
+            publications: Some(cache),
+            ..
+          },
+        ) => (cache.update_writer_proxy(writer_proxy), cache.reader_guid),
+        (
+          EntityId::SEDP_BUILTIN_TOPIC_READER,
+          Builtins {
+            topics: Some(cache),
+            ..
+          },
+        ) => (cache.update_writer_proxy(writer_proxy), cache.reader_guid),
+        (
+          EntityId::SPDP_BUILTIN_PARTICIPANT_READER,
+          Builtins {
+            participants: Some(cache),
+            ..
+          },
+        ) => (cache.update_writer_proxy(writer_proxy), cache.reader_guid),
+        (
+          EntityId::SEDP_BUILTIN_SUBSCRIPTIONS_READER,
+          Builtins {
+            subscriptions: Some(cache),
+            ..
+          },
+        ) => (cache.update_writer_proxy(writer_proxy), cache.reader_guid),
+        (
+          EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_READER,
+          Builtins {
+            participant_messages: Some(cache),
+            ..
+          },
+        ) => (cache.update_writer_proxy(writer_proxy), cache.reader_guid),
+        _ => continue,
+      };
 
-            let (upd, guid) = match (writer_eid, &mut self.builtins) {
-                (EntityId::SEDP_BUILTIN_PUBLICATIONS_WRITER, Builtins { publications: Some(cache), .. }) => (cache.update_reader_proxy(&reader_proxy), cache.writer_guid),
-                (EntityId::SEDP_BUILTIN_TOPIC_WRITER, Builtins { topics: Some(cache), .. }) => (cache.update_reader_proxy(&reader_proxy), cache.writer_guid),
-                (EntityId::SPDP_BUILTIN_PARTICIPANT_WRITER, Builtins { participants: Some(cache), .. }) => (cache.update_reader_proxy(&reader_proxy), cache.writer_guid),
-                (EntityId::SEDP_BUILTIN_SUBSCRIPTIONS_WRITER, Builtins { subscriptions: Some(cache), .. }) => (cache.update_reader_proxy(&reader_proxy), cache.writer_guid),
-                (EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_WRITER, Builtins { participant_messages: Some(cache), .. }) => {
-                    let qos = &cache.qos;
-                    let upd = if self.discovered_participant.builtin_endpoint_qos.is_some_and(|epq| epq.is_best_effort()) {
-                        let mut qos = qos.clone();
-                        qos.reliability = Some(policy::Reliability::BestEffort);
-                        cache.update_reader_proxy_with_qos(&reader_proxy, &qos)
-                    } else {
-                        cache.update_reader_proxy(&reader_proxy)
-                    };
-                    (upd, cache.writer_guid)
-                }
-                _ => continue,
-            };
-
-            if let Some((writer, domain)) = upd {
-                return Some(DomainStatusEvent::Mixed(domain, (DataStatus::Writer(writer), guid)))
-            } else {
-                continue;
-            }
-        }
-
-        while let Some((writer_eid, reader_eid, endpoint)) = self.writers_list.next() {
-            if !self.discovered_participant.available_builtin_endpoints.contains(endpoint) {
-                continue;
-            }
-
-            let writer_proxy = self.discovered_participant.as_writer_proxy(true, Some(writer_eid));
-
-            let (upd, guid) = match (reader_eid, &mut self.builtins) {
-                (EntityId::SEDP_BUILTIN_PUBLICATIONS_READER, Builtins { publications: Some(cache), .. }) => (cache.update_writer_proxy(writer_proxy), cache.reader_guid),
-                (EntityId::SEDP_BUILTIN_TOPIC_READER, Builtins { topics: Some(cache), .. }) => (cache.update_writer_proxy(writer_proxy), cache.reader_guid),
-                (EntityId::SPDP_BUILTIN_PARTICIPANT_READER, Builtins { participants: Some(cache), .. }) => (cache.update_writer_proxy(writer_proxy), cache.reader_guid),
-                (EntityId::SEDP_BUILTIN_SUBSCRIPTIONS_READER, Builtins { subscriptions: Some(cache), .. }) => (cache.update_writer_proxy(writer_proxy), cache.reader_guid),
-                (EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_READER, Builtins { participant_messages: Some(cache), .. }) => {
-                    (cache.update_writer_proxy(writer_proxy), cache.reader_guid)
-                }
-                _ => continue,
-            };
-
-            if let Some((writer, domain)) = upd {
-                return Some(DomainStatusEvent::Mixed(domain, (DataStatus::Reader(writer), guid)))
-            } else {
-                continue;
-            }
-        }
-        None
+      if let Some((writer, domain)) = upd {
+        return Some(DomainStatusEvent::Mixed(
+          domain,
+          (DataStatus::Reader(writer), guid),
+        ));
+      } else {
+        continue;
+      }
     }
+    None
+  }
 }
 
 struct BuiltinLostParticipant {
-    builtin: BuiltinParticipantLost,
-    state: BuiltinLostParticipantState,
+  builtin: BuiltinParticipantLost,
+  state: BuiltinLostParticipantState,
 }
 
 impl BuiltinLostParticipant {
-    fn next(&mut self, builtins: &mut Builtins<'_>, guid_prefix: GuidPrefix) -> Option<(DataStatus, GUID)> {
-        if let Some(r) = {
-            use BuiltinLostParticipantState as BPS;
-            match self.state {
-                BPS::Publications => self.builtin.inner(builtins.publications.as_mut().unwrap()).next(),
-                BPS::Topics => self.builtin.inner(builtins.topics.as_mut().unwrap()).next(),
-                BPS::Participants => self.builtin.inner(builtins.participants.as_mut().unwrap()).next(),
-                BPS::Subscriptions => self.builtin.inner(builtins.subscriptions.as_mut().unwrap()).next(),
-                BPS::ParticipantMessages => self.builtin.inner(builtins.participant_messages.as_mut().unwrap()).next(),
-            }
-        } {
-            return Some(r)
-        } else {
-            use BuiltinLostParticipantState as BPS;
-            match self.state {
-                BPS::Publications => {
-                    core::mem::take(&mut builtins.publications);
-                }
-                BPS::Topics => {
-                    core::mem::take(&mut builtins.topics);
-                }
-                BPS::Participants => {
-                    core::mem::take(&mut builtins.participants);
-                }
-                BPS::Subscriptions => {
-                    core::mem::take(&mut builtins.subscriptions);
-                }
-                BPS::ParticipantMessages => {
-                    core::mem::take(&mut builtins.participant_messages);
-                }
-            }
+  fn next(
+    &mut self,
+    builtins: &mut Builtins<'_>,
+    guid_prefix: GuidPrefix,
+  ) -> Option<(DataStatus, GUID)> {
+    if let Some(r) = {
+      use BuiltinLostParticipantState as BPS;
+      match self.state {
+        BPS::Publications => self
+          .builtin
+          .inner(builtins.publications.as_mut().unwrap())
+          .next(),
+        BPS::Topics => self.builtin.inner(builtins.topics.as_mut().unwrap()).next(),
+        BPS::Participants => self
+          .builtin
+          .inner(builtins.participants.as_mut().unwrap())
+          .next(),
+        BPS::Subscriptions => self
+          .builtin
+          .inner(builtins.subscriptions.as_mut().unwrap())
+          .next(),
+        BPS::ParticipantMessages => self
+          .builtin
+          .inner(builtins.participant_messages.as_mut().unwrap())
+          .next(),
+      }
+    } {
+      return Some(r);
+    } else {
+      use BuiltinLostParticipantState as BPS;
+      match self.state {
+        BPS::Publications => {
+          core::mem::take(&mut builtins.publications);
         }
-
-        if let Some(s) = Self::new(builtins, guid_prefix) {
-            *self = s;
-            self.next(builtins, guid_prefix)
-        } else {
-            None
+        BPS::Topics => {
+          core::mem::take(&mut builtins.topics);
         }
+        BPS::Participants => {
+          core::mem::take(&mut builtins.participants);
+        }
+        BPS::Subscriptions => {
+          core::mem::take(&mut builtins.subscriptions);
+        }
+        BPS::ParticipantMessages => {
+          core::mem::take(&mut builtins.participant_messages);
+        }
+      }
     }
 
-    fn new(builtins: &mut Builtins<'_>, guid_prefix: GuidPrefix) -> Option<Self> {
-        use BuiltinLostParticipantState as BPS;
-        Some(match builtins {
-            Builtins { publications: Some(b), .. } => Self { state: BPS::Publications, builtin: b.participant_lost(guid_prefix) } ,
-            Builtins { topics: Some(b), .. } => Self { state: BPS::Topics, builtin: b.participant_lost(guid_prefix) } ,
-            Builtins { participants: Some(b), .. } => Self { state: BPS::Participants, builtin: b.participant_lost(guid_prefix) } ,
-            Builtins { subscriptions: Some(b), .. } => Self { state: BPS::Subscriptions, builtin: b.participant_lost(guid_prefix) } ,
-            Builtins { participant_messages: Some(b), .. } => Self { state: BPS::ParticipantMessages, builtin: b.participant_lost(guid_prefix) } ,
-            _ => return None,
-        })
+    if let Some(s) = Self::new(builtins, guid_prefix) {
+      *self = s;
+      self.next(builtins, guid_prefix)
+    } else {
+      None
     }
+  }
+
+  fn new(builtins: &mut Builtins<'_>, guid_prefix: GuidPrefix) -> Option<Self> {
+    use BuiltinLostParticipantState as BPS;
+    Some(match builtins {
+      Builtins {
+        publications: Some(b),
+        ..
+      } => Self {
+        state: BPS::Publications,
+        builtin: b.participant_lost(guid_prefix),
+      },
+      Builtins {
+        topics: Some(b), ..
+      } => Self {
+        state: BPS::Topics,
+        builtin: b.participant_lost(guid_prefix),
+      },
+      Builtins {
+        participants: Some(b),
+        ..
+      } => Self {
+        state: BPS::Participants,
+        builtin: b.participant_lost(guid_prefix),
+      },
+      Builtins {
+        subscriptions: Some(b),
+        ..
+      } => Self {
+        state: BPS::Subscriptions,
+        builtin: b.participant_lost(guid_prefix),
+      },
+      Builtins {
+        participant_messages: Some(b),
+        ..
+      } => Self {
+        state: BPS::ParticipantMessages,
+        builtin: b.participant_lost(guid_prefix),
+      },
+      _ => return None,
+    })
+  }
 }
 
 struct CleanupLostParticipant<'a, 'c, 'f> {
-    pub(crate) discovery: &'c mut Discovery2<timer_state::Init>,
+  pub(crate) discovery: &'c mut Discovery2<timer_state::Init>,
+  readers: &'a mut BTreeMap<EntityId, Reader<timer_state::Init>>,
+  writers: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
+  cleanup: &'f mut ParticipantCleanup,
+  state: &'f mut Option<(
+    LostParticipant2<'a, 'c>,
+    Option<DomainParticipantStatusEvent>,
+  )>,
+}
+
+impl<'a, 'c, 'f> CleanupLostParticipant<'a, 'c, 'f> {
+  fn new(
+    discovery: &'c mut Discovery2<timer_state::Init>,
     readers: &'a mut BTreeMap<EntityId, Reader<timer_state::Init>>,
     writers: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
     cleanup: &'f mut ParticipantCleanup,
-    state: &'f mut Option<(LostParticipant2<'a, 'c>, Option<DomainParticipantStatusEvent>)>
+    state: &'f mut Option<(
+      LostParticipant2<'a, 'c>,
+      Option<DomainParticipantStatusEvent>,
+    )>,
+  ) -> Self {
+    Self {
+      discovery,
+      readers,
+      writers,
+      cleanup,
+      state,
+    }
+  }
 }
 
-impl <'a, 'c, 'f> CleanupLostParticipant<'a, 'c, 'f> {
-    fn new(
-        discovery: &'c mut Discovery2<timer_state::Init>,
-        readers: &'a mut BTreeMap<EntityId, Reader<timer_state::Init>>,
-        writers: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
-        cleanup: &'f mut ParticipantCleanup,
-        state: &'f mut Option<(LostParticipant2<'a, 'c>, Option<DomainParticipantStatusEvent>)>
-    ) -> Self {
-        Self {
-            discovery,
-            readers,
-            writers,
-            cleanup,
-            state,
+impl<'a, 'c, 'f> Iterator for CleanupLostParticipant<'a, 'c, 'f> {
+  type Item = DomainStatusEvent;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    if let Some((iter_state, state)) = self.state.as_mut() {
+      match (core::mem::take(state), iter_state.next()) {
+        (Some(participant), Some(data)) => {
+          return Some(DomainStatusEvent::Mixed(participant, data))
         }
+        (Some(participant), _) => return Some(DomainStatusEvent::Participant(participant)),
+        (_, Some((data, guid))) => return Some(DomainStatusEvent::Data(data, guid)),
+        _ => (),
+      }
     }
-}
 
-impl <'a, 'c, 'f> Iterator for CleanupLostParticipant<'a, 'c, 'f> {
-    type Item = DomainStatusEvent;
+    let (guid_prefix, reason) = self.cleanup.next()?;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some((iter_state, state)) = self.state.as_mut() {
-            match (core::mem::take(state), iter_state.next()) {
-                (Some(participant), Some(data)) => return Some(DomainStatusEvent::Mixed(participant, data)),
-                (Some(participant), _) => return Some(DomainStatusEvent::Participant(participant)),
-                (_, Some((data, guid))) => return Some(DomainStatusEvent::Data(data, guid)),
-                _ => (),
-            }
-        }
+    let participant_status = DomainParticipantStatusEvent::ParticipantLost {
+      id: guid_prefix,
+      reason,
+    };
 
-        let (guid_prefix, reason) = self.cleanup.next()?;
+    //SAFETY: this is not mutably borrowed more than once at a time.
+    let readers = unsafe { &mut *(self.readers as *mut _) };
+    let writers = unsafe { &mut *(self.writers as *mut _) };
+    let caches = unsafe { &mut *(&mut self.discovery.caches as *mut _) };
 
-        let participant_status = DomainParticipantStatusEvent::ParticipantLost {id: guid_prefix, reason };
+    let iter_state = LostParticipant2::new(guid_prefix, readers, writers, caches);
 
-        //SAFETY: this is not mutably borrowed more than once at a time.
-        let readers = unsafe { &mut* (self.readers as *mut _) };
-        let writers = unsafe { &mut* (self.writers as *mut _) };
-        let caches = unsafe { &mut* (&mut self.discovery.caches as *mut _) };
-
-        let iter_state = LostParticipant2::new(guid_prefix, readers, writers, caches);
-
-        *self.state = Some((iter_state, Some(participant_status)));
-        self.next()
-    }
+    *self.state = Some((iter_state, Some(participant_status)));
+    self.next()
+  }
 }
 
 use crate::io_uring::discovery::ParticipantCleanup;
-
 
 use super::writer::LostReaders;
 use super::reader::LostWriters;
 
 struct LostParticipant2<'a, 'b> {
-    guid_prefix: GuidPrefix,
-    readers: std::collections::btree_map::ValuesMut<'a, EntityId, Reader<timer_state::Init>>,
-    writers: std::collections::hash_map::ValuesMut<'a, EntityId, Writer<timer_state::Init>>,
-    stored_reader: Option<LostReaders<'a>>,
-    stored_writer: Option<LostWriters<'a>>,
+  guid_prefix: GuidPrefix,
+  readers: std::collections::btree_map::ValuesMut<'a, EntityId, Reader<timer_state::Init>>,
+  writers: std::collections::hash_map::ValuesMut<'a, EntityId, Writer<timer_state::Init>>,
+  stored_reader: Option<LostReaders<'a>>,
+  stored_writer: Option<LostWriters<'a>>,
 
-    lost_builtins: Option<BuiltinLostParticipant>,
-    builtins: Builtins<'b>,
+  lost_builtins: Option<BuiltinLostParticipant>,
+  builtins: Builtins<'b>,
 }
 
-impl <'a, 'b> LostParticipant2<'a, 'b> {
-    fn new(
-        guid_prefix: GuidPrefix,
-        readers: &'a mut BTreeMap<EntityId, Reader<timer_state::Init>>,
-        writers: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
-        caches: &'b mut Caches<timer_state::Init>,
-        ) -> Self {
-        let readers = readers.values_mut();
-        let writers = writers.values_mut();
-        let mut builtins = Builtins::new(caches);
+impl<'a, 'b> LostParticipant2<'a, 'b> {
+  fn new(
+    guid_prefix: GuidPrefix,
+    readers: &'a mut BTreeMap<EntityId, Reader<timer_state::Init>>,
+    writers: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
+    caches: &'b mut Caches<timer_state::Init>,
+  ) -> Self {
+    let readers = readers.values_mut();
+    let writers = writers.values_mut();
+    let mut builtins = Builtins::new(caches);
 
-        let lost_builtins = BuiltinLostParticipant::new(&mut builtins, guid_prefix);
+    let lost_builtins = BuiltinLostParticipant::new(&mut builtins, guid_prefix);
 
-        Self {
-            readers,
-            writers,
-            stored_reader: None,
-            stored_writer: None,
-            guid_prefix,
-            builtins,
-            lost_builtins,
-        }
+    Self {
+      readers,
+      writers,
+      stored_reader: None,
+      stored_writer: None,
+      guid_prefix,
+      builtins,
+      lost_builtins,
     }
+  }
 }
 
 use crate::io_uring::discovery::{BuiltinParticipantLost};
 
 enum BuiltinLostParticipantState {
-    Publications,
-    Topics,
-    Participants,
-    Subscriptions,
-    ParticipantMessages,
+  Publications,
+  Topics,
+  Participants,
+  Subscriptions,
+  ParticipantMessages,
 }
 
 impl Iterator for LostParticipant2<'_, '_> {
-    type Item = (DataStatus, GUID);
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(reader) = self.stored_reader.as_mut() {
-            if let Some((status, guid)) = reader.next() {
-                return Some((DataStatus::Writer(status), guid))
-            }
-        }
-
-        if let Some(writer) = self.stored_writer.as_mut() {
-            if let Some((status, guid)) = writer.next() {
-                return Some((DataStatus::Reader(status), guid))
-            }
-        }
-
-        if let Some(builtin) = self.lost_builtins.as_mut() {
-            if let Some(r) = builtin.next(&mut self.builtins, self.guid_prefix) {
-                return Some(r)
-            }
-        }
-
-        if let Some(writer) = self.writers.next() {
-            self.stored_reader = Some(writer.participant_lost(self.guid_prefix));
-        }
-
-        if let Some(reader) = self.readers.next() {
-            self.stored_writer = Some(reader.participant_lost(self.guid_prefix))
-        }
-        None
+  type Item = (DataStatus, GUID);
+  fn next(&mut self) -> Option<Self::Item> {
+    if let Some(reader) = self.stored_reader.as_mut() {
+      if let Some((status, guid)) = reader.next() {
+        return Some((DataStatus::Writer(status), guid));
+      }
     }
+
+    if let Some(writer) = self.stored_writer.as_mut() {
+      if let Some((status, guid)) = writer.next() {
+        return Some((DataStatus::Reader(status), guid));
+      }
+    }
+
+    if let Some(builtin) = self.lost_builtins.as_mut() {
+      if let Some(r) = builtin.next(&mut self.builtins, self.guid_prefix) {
+        return Some(r);
+      }
+    }
+
+    if let Some(writer) = self.writers.next() {
+      self.stored_reader = Some(writer.participant_lost(self.guid_prefix));
+    }
+
+    if let Some(reader) = self.readers.next() {
+      self.stored_writer = Some(reader.participant_lost(self.guid_prefix))
+    }
+    None
+  }
 }
 
-use std::{
-  collections::HashMap,
-};
+use std::{collections::HashMap};
 
 use log::{debug, error, warn};
 
 use crate::{
-  dds::{
-    qos::policy,
-    statusevents::DomainParticipantStatusEvent,
-  },
+  dds::{qos::policy, statusevents::DomainParticipantStatusEvent},
   discovery::{
     sedp_messages::{DiscoveredReaderData, DiscoveredWriterData},
   },
   messages::submessages::submessages::AckSubmessage,
   //network::{udp_listener::UDPListener, udp_sender::UDPSender},
   qos::HasQoSPolicy,
-  rtps::{
-    constant::*,
-    rtps_reader_proxy::RtpsReaderProxy,
-    rtps_writer_proxy::RtpsWriterProxy,
-  },
+  rtps::{constant::*, rtps_reader_proxy::RtpsReaderProxy, rtps_writer_proxy::RtpsWriterProxy},
   structure::guid::{EntityId, GuidPrefix, GUID},
 };
 
@@ -790,301 +1133,423 @@ use crate::{
 use crate::rtps::dp_event_loop::DomainInfo;
 
 struct DiscoveredUpdates2<C, U> {
-    remote: C,
-    remote_discovered: U,
+  remote: C,
+  remote_discovered: U,
 }
 
-type DiscoveredReaderUpdates2<'a> = DiscoveredUpdates2<hash_map::ValuesMut<'a, EntityId, Writer<timer_state::Init>>, DiscoveredReaderData>;
+type DiscoveredReaderUpdates2<'a> = DiscoveredUpdates2<
+  hash_map::ValuesMut<'a, EntityId, Writer<timer_state::Init>>,
+  DiscoveredReaderData,
+>;
 
-impl <'a> DiscoveredUpdates2<hash_map::ValuesMut<'a, EntityId, Writer<timer_state::Init>>, DiscoveredReaderData> {
-    fn new_reader_data(map: &'a mut HashMap<EntityId, Writer<timer_state::Init>>, reader_data: DiscoveredReaderData) -> Self {
-        Self {
-            remote: map.values_mut(),
-            remote_discovered: reader_data,
-        }
+impl<'a>
+  DiscoveredUpdates2<
+    hash_map::ValuesMut<'a, EntityId, Writer<timer_state::Init>>,
+    DiscoveredReaderData,
+  >
+{
+  fn new_reader_data(
+    map: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
+    reader_data: DiscoveredReaderData,
+  ) -> Self {
+    Self {
+      remote: map.values_mut(),
+      remote_discovered: reader_data,
     }
+  }
 }
 
-type DiscoveredWriterUpdates2<'a> = DiscoveredUpdates2<btree_map::ValuesMut<'a, EntityId, Reader<timer_state::Init>>, DiscoveredWriterData>;
+type DiscoveredWriterUpdates2<'a> = DiscoveredUpdates2<
+  btree_map::ValuesMut<'a, EntityId, Reader<timer_state::Init>>,
+  DiscoveredWriterData,
+>;
 
-impl <'a> DiscoveredUpdates2<btree_map::ValuesMut<'a, EntityId, Reader<timer_state::Init>>, DiscoveredWriterData> {
-    fn new_writer_data(map: &'a mut BTreeMap<EntityId, Reader<timer_state::Init>>, writer_data: DiscoveredWriterData) -> Self {
-        Self {
-            remote: map.values_mut(),
-            remote_discovered: writer_data,
-        }
+impl<'a>
+  DiscoveredUpdates2<
+    btree_map::ValuesMut<'a, EntityId, Reader<timer_state::Init>>,
+    DiscoveredWriterData,
+  >
+{
+  fn new_writer_data(
+    map: &'a mut BTreeMap<EntityId, Reader<timer_state::Init>>,
+    writer_data: DiscoveredWriterData,
+  ) -> Self {
+    Self {
+      remote: map.values_mut(),
+      remote_discovered: writer_data,
     }
+  }
 }
 
 use std::collections::hash_map;
 
-impl <'a> Iterator for DiscoveredUpdates2<hash_map::ValuesMut<'a, EntityId, Writer<timer_state::Init>>, DiscoveredReaderData> {
-    type Item = (DataWriterStatus, DomainParticipantStatusEvent);
+impl<'a> Iterator
+  for DiscoveredUpdates2<
+    hash_map::ValuesMut<'a, EntityId, Writer<timer_state::Init>>,
+    DiscoveredReaderData,
+  >
+{
+  type Item = (DataWriterStatus, DomainParticipantStatusEvent);
 
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some(writer) = self.remote.next() {
-            if self.remote_discovered.subscription_topic_data.topic_name() != writer.topic_name() {
-                continue;
-            }
+  fn next(&mut self) -> Option<Self::Item> {
+    while let Some(writer) = self.remote.next() {
+      use crate::structure::entity::RTPSEntity;
+      if self.remote_discovered.subscription_topic_data.topic_name() != writer.topic_name() {
+        continue;
+      }
 
-            let match_to_reader = true;
+      let match_to_reader = true;
 
-            if !match_to_reader {
-                continue;
-            }
+      if !match_to_reader {
+        continue;
+      }
 
-            let requested_qos = self.remote_discovered.subscription_topic_data.qos();
+      let requested_qos = self.remote_discovered.subscription_topic_data.qos();
 
-            let Some(r) = writer.update_reader_proxy(&RtpsReaderProxy::from_discovered_reader_data(&self.remote_discovered, &[], &[]), &requested_qos) else {
-                continue;
-            };
+      let Some(r) = writer.update_reader_proxy(
+        &RtpsReaderProxy::from_discovered_reader_data(&self.remote_discovered, &[], &[]),
+        &requested_qos,
+      ) else {
+        continue;
+      };
+      println!("updated proxy: {r:?}");
 
-            return Some(r);
-        }
-        None
+      return Some(r);
     }
+    None
+  }
 }
 
 use std::collections::btree_map;
 
-impl <'a> Iterator for DiscoveredUpdates2<btree_map::ValuesMut<'a, EntityId, Reader<timer_state::Init>>, DiscoveredWriterData> {
-    type Item = (DataReaderStatus, DomainParticipantStatusEvent);
+impl<'a> Iterator
+  for DiscoveredUpdates2<
+    btree_map::ValuesMut<'a, EntityId, Reader<timer_state::Init>>,
+    DiscoveredWriterData,
+  >
+{
+  type Item = (DataReaderStatus, DomainParticipantStatusEvent);
 
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some(reader) = self.remote.next() {
-            if self.remote_discovered.publication_topic_data.topic_name() != reader.topic_name() {
-                continue;
-            }
+  fn next(&mut self) -> Option<Self::Item> {
+    while let Some(reader) = self.remote.next() {
+      if self.remote_discovered.publication_topic_data.topic_name() != reader.topic_name() {
+        continue;
+      }
 
-            let match_to_reader = true;
+      let match_to_reader = true;
 
-            if !match_to_reader {
-                continue;
-            }
+      if !match_to_reader {
+        continue;
+      }
 
-            let offered_qos = self.remote_discovered.publication_topic_data.qos();
+      let offered_qos = self.remote_discovered.publication_topic_data.qos();
 
-            let Some(r) = reader.update_writer_proxy(RtpsWriterProxy::from_discovered_writer_data(&self.remote_discovered, &[], &[]), &offered_qos) else {
-                continue;
-            };
+      let Some(r) = reader.update_writer_proxy(
+        RtpsWriterProxy::from_discovered_writer_data(&self.remote_discovered, &[], &[]),
+        &offered_qos,
+      ) else {
+        continue;
+      };
 
-            return Some(r);
-        }
-        None
+      return Some(r);
     }
+    None
+  }
 }
 
 use crate::io_uring::discovery::Discovered;
 
 #[derive(Debug)]
 pub enum DataStatus {
-    Reader(DataReaderStatus),
-    Writer(DataWriterStatus),
+  Reader(DataReaderStatus),
+  Writer(DataWriterStatus),
 }
 
 struct DDIState<'a, 'c, 'd, 'e, 'f> {
-    pub(crate) discovery: &'c mut Discovery2<timer_state::Init>,
-    pub(crate) discovery_db: &'d mut DiscoveryDB,
+  pub(crate) discovery: &'c mut Discovery2<timer_state::Init>,
+  pub(crate) discovery_db: &'d mut DiscoveryDB,
+  readers: &'a mut BTreeMap<EntityId, Reader<timer_state::Init>>,
+  writers: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
+  discovered: &'f mut DiscoveredKind,
+  state: &'f mut Option<(DState<'a, 'c>, Option<DomainParticipantStatusEvent>)>,
+  ring: &'e mut IoUring,
+  udp_sender: &'e UDPSender,
+}
+
+impl<'a, 'c, 'd, 'e, 'f> DDIState<'a, 'c, 'd, 'e, 'f> {
+  fn new(
+    discovery: &'c mut Discovery2<timer_state::Init>,
+    discovery_db: &'d mut DiscoveryDB,
     readers: &'a mut BTreeMap<EntityId, Reader<timer_state::Init>>,
     writers: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
     discovered: &'f mut DiscoveredKind,
     state: &'f mut Option<(DState<'a, 'c>, Option<DomainParticipantStatusEvent>)>,
     ring: &'e mut IoUring,
     udp_sender: &'e UDPSender,
+  ) -> Self {
+    Self {
+      discovery,
+      discovery_db,
+      readers,
+      writers,
+      discovered,
+      state,
+      ring,
+      udp_sender,
+    }
+  }
 }
 
-impl <'a, 'c, 'd, 'e, 'f> DDIState<'a, 'c, 'd, 'e, 'f> {
-    fn new(
-        discovery: &'c mut Discovery2<timer_state::Init>,
-        discovery_db: &'d mut DiscoveryDB,
-        readers: &'a mut BTreeMap<EntityId, Reader<timer_state::Init>>,
-        writers: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
-        discovered: &'f mut DiscoveredKind,
-        state: &'f mut Option<(DState<'a, 'c>, Option<DomainParticipantStatusEvent>)>,
-        ring: &'e mut IoUring,
-        udp_sender: &'e UDPSender,
-        ) -> Self {
-        Self {
-            discovery,
-            discovery_db,
-            readers,
-            writers,
-            discovered,
-            state,
-            ring,
-            udp_sender,
-        }
-    }
-}
+impl<'a, 'c, 'd, 'e, 'f> Iterator for DDIState<'a, 'c, 'd, 'e, 'f> {
+  type Item = DomainStatusEvent;
 
-impl <'a, 'c, 'd, 'e, 'f> Iterator for DDIState<'a, 'c, 'd, 'e, 'f> {
-    type Item = DomainStatusEvent;
+  fn next(&mut self) -> Option<Self::Item> {
+    /*
+    macro_rules! check_matched_publication {
+        ($ev:expr) => {
+            match &$ev {
+              DomainStatusEvent::Data(status, guid) | DomainStatusEvent::Mixed(_, (status, guid)) => match status {
+                  DataStatus::Writer(status) => match status {
+                      DataWriterStatus::PublicationMatched{..} => {
+                          if let Some(writer) = self.writers.get_mut(&guid.entity_id) {
+                              writer.handle_heartbeat_tick(false, self.udp_sender, self.ring);
+                              println!("sending inital heartbeat");
+                          }
+                          println!("added: {guid:?}");
+                      }
+                      _ => (),
+                  }
+                  _ => (),
+              }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        macro_rules! try_take_state {
-            ($state:expr) => {
-                if let Some((state, stored)) = $state.as_mut() {
-                    if let Some(participant_status) = core::mem::take(stored) {
-                        Some(DomainStatusEvent::Participant(participant_status))
-                    } else if let Some(r) = state.next() {
-                        Some(r)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+              /*
+              DomainStatusEvent::Data(DataStatus::Writer(DataWriterStatus::PublicationMatched {..}), guid) | DomainStatusEvent::Mixed(_, (DataStatus::Writer(DataWriterStatus::PublicationMatched {..}), guid)) => {
+                  if let Some(writer) = self.writers.get_mut(&guid.entity_id) {
+                      writer.handle_heartbeat_tick(false, self.udp_sender, self.ring);
+                      println!("sending inital heartbeat");
+                  }
+              }
+              */
+              _ => (),
             }
         }
-
-        if let Some(r) = try_take_state!(self.state) {
-            return Some(r)
-        }
-
-        let mut discovered = Discovered::new(self.discovery, self.discovery_db, &mut self.discovered);
-        while let Some((discovery, status)) = discovered.next() {
-            //SAFETY: this is not mutably borrowed more than once at a time.
-            let readers = unsafe { &mut* (self.readers as *mut _) };
-            let writers = unsafe { &mut* (self.writers as *mut _) };
-            let caches = unsafe { &mut* (&mut discovered.discovery.caches as *mut _) };
-
-            let Some(state) = DState::new(discovery, readers, writers, caches, self.ring, discovered.discovery_db, self.udp_sender) else {
-                continue;
-            };
-
-            let mut state = Some(state);
-
-            if let Some(participant_status) = status {
-                *self.state = state;
-                return Some(DomainStatusEvent::Participant(participant_status))
-            } else if let Some(r) = try_take_state!(state) {
-                *self.state = state;
-                return Some(r)
-            }
-        }
-        None
     }
+    */
+
+    macro_rules! try_take_state {
+      ($state:expr) => {
+        if let Some((state, stored)) = $state.as_mut() {
+          if let Some(participant_status) = core::mem::take(stored) {
+            Some(DomainStatusEvent::Participant(participant_status))
+          } else if let Some(r) = state.next() {
+            //check_matched_publication!(r);
+            Some(r)
+          } else {
+            None
+          }
+        } else {
+          None
+        }
+      };
+    }
+
+    if let Some(r) = try_take_state!(self.state) {
+      //check_matched_publication!(r);
+      return Some(r);
+    }
+
+    let mut discovered = Discovered::new(self.discovery, self.discovery_db, &mut self.discovered);
+    while let Some((discovery, status)) = discovered.next() {
+      //SAFETY: this is not mutably borrowed more than once at a time.
+      let readers = unsafe { &mut *(self.readers as *mut _) };
+      let writers = unsafe { &mut *(self.writers as *mut _) };
+      let caches = unsafe { &mut *(&mut discovered.discovery.caches as *mut _) };
+
+      let Some(state) = DState::new(
+        discovery,
+        readers,
+        writers,
+        caches,
+        self.ring,
+        discovered.discovery_db,
+        self.udp_sender,
+      ) else {
+        continue;
+      };
+
+      let mut state = Some(state);
+
+      if let Some(participant_status) = status {
+        *self.state = state;
+        return Some(DomainStatusEvent::Participant(participant_status));
+      } else if let Some(r) = try_take_state!(state) {
+        //check_matched_publication!(r);
+        *self.state = state;
+        return Some(r);
+      }
+    }
+    None
+  }
 }
 
 enum DState<'a, 'b> {
-    ReaderLost(LostReaderUpdates<'a>),
-    ReaderUpdates(DiscoveredReaderUpdates2<'a>),
-    WriterLost(LostWriterUpdates<'a>),
-    WriterUpdates(DiscoveredWriterUpdates2<'a>),
-    ParticipantLost(LostParticipant2<'a, 'b>),
-    ParticipantUpdates(UpdatedParticipant2<'b>),
+  ReaderLost(LostReaderUpdates<'a>),
+  ReaderUpdates(DiscoveredReaderUpdates2<'a>),
+  WriterLost(LostWriterUpdates<'a>),
+  WriterUpdates(DiscoveredWriterUpdates2<'a>),
+  ParticipantLost(LostParticipant2<'a, 'b>),
+  ParticipantUpdates(UpdatedParticipant2<'b>),
 }
 
-impl <'a, 'b> DState<'a, 'b> {
-    fn new(notif: DiscoveryNotificationType,
-        readers: &'a mut BTreeMap<EntityId, Reader<timer_state::Init>>,
-        writers: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
-        caches: &'b mut Caches<timer_state::Init>,
-        ring: &mut IoUring,
-        discovery_db: &mut DiscoveryDB,
-        udp_sender: &UDPSender,
-           ) -> Option<(Self, Option<DomainParticipantStatusEvent>)> {
-        use DiscoveryNotificationType as DDT;
+impl<'a, 'b> DState<'a, 'b> {
+  fn new(
+    notif: DiscoveryNotificationType,
+    readers: &'a mut BTreeMap<EntityId, Reader<timer_state::Init>>,
+    writers: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
+    caches: &'b mut Caches<timer_state::Init>,
+    ring: &mut IoUring,
+    discovery_db: &mut DiscoveryDB,
+    udp_sender: &UDPSender,
+  ) -> Option<(Self, Option<DomainParticipantStatusEvent>)> {
+    use DiscoveryNotificationType as DDT;
 
-        match notif {
-            DDT::WriterUpdated {
-                discovered_writer_data,
-            } => {
-                use chrono::Utc;
-                use crate::EndpointDescription;
-                let domain_ev = DomainParticipantStatusEvent::WriterDetected {
-                    writer: EndpointDescription {
-                        updated_time: Utc::now(),
-                        guid: discovered_writer_data.writer_proxy.remote_writer_guid,
-                        topic_name: discovered_writer_data.publication_topic_data.topic_name.clone(),
-                        type_name: discovered_writer_data.publication_topic_data.type_name.clone(),
-                        qos: discovered_writer_data.publication_topic_data.qos(),
-                    }
-                };
+    match notif {
+      DDT::WriterUpdated {
+        discovered_writer_data,
+      } => {
+        use chrono::Utc;
+        use crate::EndpointDescription;
+        let domain_ev = DomainParticipantStatusEvent::WriterDetected {
+          writer: EndpointDescription {
+            updated_time: Utc::now(),
+            guid: discovered_writer_data.writer_proxy.remote_writer_guid,
+            topic_name: discovered_writer_data
+              .publication_topic_data
+              .topic_name
+              .clone(),
+            type_name: discovered_writer_data
+              .publication_topic_data
+              .type_name
+              .clone(),
+            qos: discovered_writer_data.publication_topic_data.qos(),
+          },
+        };
 
-                let state = Self::WriterUpdates(DiscoveredWriterUpdates2::new_writer_data(readers, discovered_writer_data));
+        let state = Self::WriterUpdates(DiscoveredWriterUpdates2::new_writer_data(
+          readers,
+          discovered_writer_data,
+        ));
 
-                Some((state, Some(domain_ev)))
-            }
-            DDT::WriterLost {
-                writer_guid
-            } => {
-                Some((Self::WriterLost(LostWriterUpdates::new(readers.values_mut(), writer_guid)), None))
-            }
-            DDT::ReaderUpdated {
-                discovered_reader_data,
-            } => {
-                use chrono::Utc;
-                use crate::EndpointDescription;
-                let domain_ev = DomainParticipantStatusEvent::ReaderDetected {
-                    reader: EndpointDescription {
-                        updated_time: Utc::now(),
-                        guid: discovered_reader_data.reader_proxy.remote_reader_guid,
-                        topic_name: discovered_reader_data.subscription_topic_data.topic_name.clone(),
-                        type_name: discovered_reader_data.subscription_topic_data.type_name().clone(),
-                        qos: discovered_reader_data.subscription_topic_data.qos(),
-                    }
-                };
+        Some((state, Some(domain_ev)))
+      }
+      DDT::WriterLost { writer_guid } => Some((
+        Self::WriterLost(LostWriterUpdates::new(readers.values_mut(), writer_guid)),
+        None,
+      )),
+      DDT::ReaderUpdated {
+        discovered_reader_data,
+      } => {
+        use chrono::Utc;
+        use crate::EndpointDescription;
+        let domain_ev = DomainParticipantStatusEvent::ReaderDetected {
+          reader: EndpointDescription {
+            updated_time: Utc::now(),
+            guid: discovered_reader_data.reader_proxy.remote_reader_guid,
+            topic_name: discovered_reader_data
+              .subscription_topic_data
+              .topic_name
+              .clone(),
+            type_name: discovered_reader_data
+              .subscription_topic_data
+              .type_name()
+              .clone(),
+            qos: discovered_reader_data.subscription_topic_data.qos(),
+          },
+        };
 
-                let state = Self::ReaderUpdates(DiscoveredReaderUpdates2::new_reader_data(writers, discovered_reader_data));
+        let state = Self::ReaderUpdates(DiscoveredReaderUpdates2::new_reader_data(
+          writers,
+          discovered_reader_data,
+        ));
 
-                Some((state, Some(domain_ev)))
-            }
-            DDT::ReaderLost {
-                reader_guid
-            } => {
-                Some((Self::ReaderLost(LostReaderUpdates::new(writers.values_mut(), reader_guid)), None))
-            }
-            DDT::ParticipantUpdated {
-                guid_prefix
-            } => {
-                let participant_proxy = discovery_db.find_participant_proxy(guid_prefix)?;
+        Some((state, Some(domain_ev)))
+      }
+      DDT::ReaderLost { reader_guid } => Some((
+        Self::ReaderLost(LostReaderUpdates::new(writers.values_mut(), reader_guid)),
+        None,
+      )),
+      DDT::ParticipantUpdated { guid_prefix } => {
+        let participant_proxy = discovery_db.find_participant_proxy(guid_prefix)?;
 
-                //FIXME: this may be able to avoid a clone now.
-                Some((Self::ParticipantUpdates(UpdatedParticipant2::new(caches, participant_proxy.clone())), None))
-            }
-            DDT::ParticipantLost {
-                guid_prefix
-            } => {
-                Some((Self::ParticipantLost(LostParticipant2::new(guid_prefix, readers, writers, caches)), None))
-            }
-            DDT::AssertTopicLiveliness {
-                writer_guid,
-                manual_assertion,
-            } => {
-                writers
-                    .get_mut(&writer_guid.entity_id)
-                    .map(|w| w.handle_heartbeat_tick(manual_assertion, udp_sender, ring));
-                None
-            }
-            DDT::TopicDiscovered => None,
-            o => todo!("missed {o:?}")
-        }
+        //FIXME: this may be able to avoid a clone now.
+        Some((
+          Self::ParticipantUpdates(UpdatedParticipant2::new(caches, participant_proxy.clone())),
+          None,
+        ))
+      }
+      DDT::ParticipantLost { guid_prefix } => Some((
+        Self::ParticipantLost(LostParticipant2::new(guid_prefix, readers, writers, caches)),
+        None,
+      )),
+      DDT::AssertTopicLiveliness {
+        writer_guid,
+        manual_assertion,
+      } => {
+        writers
+          .get_mut(&writer_guid.entity_id)
+          .map(|w| w.handle_heartbeat_tick(manual_assertion, udp_sender, ring));
+        None
+      }
+      DDT::TopicDiscovered => None,
+      o => todo!("missed {o:?}"),
     }
+  }
 }
 
-impl <'a, 'b> Iterator for DState<'a, 'b> {
-    type Item = DomainStatusEvent;
+impl<'a, 'b> Iterator for DState<'a, 'b> {
+  type Item = DomainStatusEvent;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::ReaderLost(updates) => updates.next().map(|u| DomainStatusEvent::Data(DataStatus::Writer(u), updates.reader_guid)),
-            Self::ReaderUpdates(updates) => updates.next().map(|(writer, domain)| DomainStatusEvent::Mixed(domain, (DataStatus::Writer(writer), updates.remote_discovered.reader_proxy.remote_reader_guid))),
-            Self::WriterLost(updates) => updates.next().map(|u| DomainStatusEvent::Data(DataStatus::Reader(u), updates.writer_guid)),
-            Self::WriterUpdates(updates) => updates.next().map(|(reader, domain)| DomainStatusEvent::Mixed(domain, (DataStatus::Reader(reader), updates.remote_discovered.writer_proxy.remote_writer_guid))),
-            Self::ParticipantLost(updates) => updates.next().map(|(data, guid)| DomainStatusEvent::Data(data, guid)),
-            Self::ParticipantUpdates(updates) => updates.next(),
-        }
+  fn next(&mut self) -> Option<Self::Item> {
+    match self {
+      Self::ReaderLost(updates) => updates
+        .next()
+        .map(|u| DomainStatusEvent::Data(DataStatus::Writer(u), updates.reader_guid)),
+      Self::ReaderUpdates(updates) => updates.next().map(|(writer, domain)| {
+        DomainStatusEvent::Mixed(
+          domain,
+          (
+            DataStatus::Writer(writer),
+            updates.remote_discovered.reader_proxy.remote_reader_guid,
+          ),
+        )
+      }),
+      Self::WriterLost(updates) => updates
+        .next()
+        .map(|u| DomainStatusEvent::Data(DataStatus::Reader(u), updates.writer_guid)),
+      Self::WriterUpdates(updates) => updates.next().map(|(reader, domain)| {
+        DomainStatusEvent::Mixed(
+          domain,
+          (
+            DataStatus::Reader(reader),
+            updates.remote_discovered.writer_proxy.remote_writer_guid,
+          ),
+        )
+      }),
+      Self::ParticipantLost(updates) => updates
+        .next()
+        .map(|(data, guid)| DomainStatusEvent::Data(data, guid)),
+      Self::ParticipantUpdates(updates) => updates.next(),
     }
+  }
 }
 
 use io_uring::IoUring;
 
 #[derive(Debug)]
 pub enum DomainStatusEvent {
-    Participant(DomainParticipantStatusEvent),
-    Data(DataStatus, GUID),
-    Mixed(DomainParticipantStatusEvent, (DataStatus, GUID))
+  Participant(DomainParticipantStatusEvent),
+  Data(DataStatus, GUID),
+  Mixed(DomainParticipantStatusEvent, (DataStatus, GUID)),
 }
 
 use std::vec;
@@ -1092,67 +1557,67 @@ use std::vec;
 use crate::{DataWriterStatus, DataReaderStatus};
 
 struct LostReaderUpdates<'a> {
-    remote_writers: std::collections::hash_map::ValuesMut<'a, EntityId, Writer<timer_state::Init>>,
-    reader_guid: GUID,
+  remote_writers: std::collections::hash_map::ValuesMut<'a, EntityId, Writer<timer_state::Init>>,
+  reader_guid: GUID,
 }
 
-impl <'a> LostReaderUpdates<'a> {
-    fn new(
+impl<'a> LostReaderUpdates<'a> {
+  fn new(
     remote_writers: std::collections::hash_map::ValuesMut<'a, EntityId, Writer<timer_state::Init>>,
     reader_guid: GUID,
-        ) -> Self {
-        Self {
-            remote_writers,
-            reader_guid,
-        }
+  ) -> Self {
+    Self {
+      remote_writers,
+      reader_guid,
     }
+  }
 }
 
 impl Iterator for LostReaderUpdates<'_> {
-    type Item = DataWriterStatus;
+  type Item = DataWriterStatus;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some(writer) = self.remote_writers.next() {
-            if let Some(ret) = writer.reader_lost(self.reader_guid) {
-                return Some(ret)
-            } else {
-                continue;
-            }
-        }
-        None
+  fn next(&mut self) -> Option<Self::Item> {
+    while let Some(writer) = self.remote_writers.next() {
+      if let Some(ret) = writer.reader_lost(self.reader_guid) {
+        return Some(ret);
+      } else {
+        continue;
+      }
     }
+    None
+  }
 }
 
 struct LostWriterUpdates<'a> {
-    remote_readers: std::collections::btree_map::ValuesMut<'a, EntityId, Reader<timer_state::Init>>,
-    writer_guid: GUID,
+  remote_readers: std::collections::btree_map::ValuesMut<'a, EntityId, Reader<timer_state::Init>>,
+  writer_guid: GUID,
 }
 
-impl <'a> LostWriterUpdates<'a> {
-    fn new(
+impl<'a> LostWriterUpdates<'a> {
+  fn new(
     remote_readers: std::collections::btree_map::ValuesMut<'a, EntityId, Reader<timer_state::Init>>,
     writer_guid: GUID,
-        ) -> Self {
-        Self {
-            remote_readers,
-            writer_guid,
-        }
+  ) -> Self {
+    Self {
+      remote_readers,
+      writer_guid,
     }
+  }
 }
 
 impl Iterator for LostWriterUpdates<'_> {
-    type Item = DataReaderStatus;
+  type Item = DataReaderStatus;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some(reader) = self.remote_readers.next() {
-            if let Some(ret) = reader.remove_writer_proxy(self.writer_guid) {
-                return Some(ret);
-            } else {
-                continue;
-            }
-        }
-        None
+  fn next(&mut self) -> Option<Self::Item> {
+    while let Some(reader) = self.remote_readers.next() {
+      if let Some(ret) = reader.remove_writer_proxy(self.writer_guid) {
+        return Some(ret);
+      } else {
+        continue;
+      }
     }
+    None
+  }
 }
 
 #[cfg(feature = "security")]
@@ -1192,239 +1657,253 @@ fn check_are_endpoints_securities_compatible(
 }
 
 struct UpdatedWritersUpdates<'a, 'b> {
+  available_readers: &'a mut std::collections::BTreeMap<EntityId, Reader<timer_state::Init>>,
+  writers_init_list: std::vec::IntoIter<(EntityId, EntityId, u32)>,
+  discovered_participant: &'b crate::discovery::SpdpDiscoveredParticipantData,
+}
+
+impl<'a, 'b> UpdatedWritersUpdates<'a, 'b> {
+  fn new(
     available_readers: &'a mut std::collections::BTreeMap<EntityId, Reader<timer_state::Init>>,
     writers_init_list: std::vec::IntoIter<(EntityId, EntityId, u32)>,
     discovered_participant: &'b crate::discovery::SpdpDiscoveredParticipantData,
-}
-
-impl <'a, 'b> UpdatedWritersUpdates<'a, 'b> {
-    fn new(
-        available_readers: &'a mut std::collections::BTreeMap<EntityId, Reader<timer_state::Init>>,
-        writers_init_list: std::vec::IntoIter<(EntityId, EntityId, u32)>,
-        discovered_participant: &'b crate::discovery::SpdpDiscoveredParticipantData,
-        ) -> Self {
-        Self {
-            available_readers,
-            writers_init_list,
-            discovered_participant,
-        }
+  ) -> Self {
+    Self {
+      available_readers,
+      writers_init_list,
+      discovered_participant,
     }
+  }
 }
 
 impl Iterator for UpdatedWritersUpdates<'_, '_> {
-    type Item = (DataReaderStatus, DomainParticipantStatusEvent);
+  type Item = (DataReaderStatus, DomainParticipantStatusEvent);
 
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some((writer_eid, reader_eid, endpoint)) = self.writers_init_list.next() {
-            let Some(reader) = self.available_readers.get_mut(&reader_eid) else {
-                continue;
-            };
+  fn next(&mut self) -> Option<Self::Item> {
+    while let Some((writer_eid, reader_eid, endpoint)) = self.writers_init_list.next() {
+      let Some(reader) = self.available_readers.get_mut(&reader_eid) else {
+        continue;
+      };
 
-            debug!("try update_discovery_reader - {:?}", reader.topic_name());
+      debug!("try update_discovery_reader - {:?}", reader.topic_name());
 
-            if !self.discovered_participant
-              .available_builtin_endpoints
-              .contains(endpoint)
-            {
-                continue;
-            }
+      if !self
+        .discovered_participant
+        .available_builtin_endpoints
+        .contains(endpoint)
+      {
+        continue;
+      }
 
-            let wp = self.discovered_participant.as_writer_proxy(true, Some(writer_eid));
+      let wp = self
+        .discovered_participant
+        .as_writer_proxy(true, Some(writer_eid));
 
-            let qos = reader.qos();
+      let qos = reader.qos();
 
-            let ret = reader.update_writer_proxy(wp, &qos);
-            debug!(
-                "update_discovery_reader - endpoint {:?} - {:?}",
-                endpoint, self.discovered_participant.participant_guid
-            );
+      let ret = reader.update_writer_proxy(wp, &qos);
+      debug!(
+        "update_discovery_reader - endpoint {:?} - {:?}",
+        endpoint, self.discovered_participant.participant_guid
+      );
 
-            if let Some(ret) = ret {
-                return Some(ret);
-            } else {
-                continue;
-            }
-        }
-        None
+      if let Some(ret) = ret {
+        return Some(ret);
+      } else {
+        continue;
+      }
     }
+    None
+  }
 }
 
 //TODO: move this into a fn.
 struct UpdatedParticipant<'a> {
+  readers: &'a mut std::collections::BTreeMap<EntityId, Reader<timer_state::Init>>,
+  writers: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
+  readers_init_list: std::vec::IntoIter<(EntityId, EntityId, u32)>,
+  writers_init_list: std::vec::IntoIter<(EntityId, EntityId, u32)>,
+  discovered_participant: crate::discovery::SpdpDiscoveredParticipantData,
+}
+
+impl<'a> UpdatedParticipant<'a> {
+  fn new(
     readers: &'a mut std::collections::BTreeMap<EntityId, Reader<timer_state::Init>>,
     writers: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
     readers_init_list: std::vec::IntoIter<(EntityId, EntityId, u32)>,
     writers_init_list: std::vec::IntoIter<(EntityId, EntityId, u32)>,
     discovered_participant: crate::discovery::SpdpDiscoveredParticipantData,
-}
-
-impl <'a> UpdatedParticipant<'a> {
-    fn new(
-        readers: &'a mut std::collections::BTreeMap<EntityId, Reader<timer_state::Init>>,
-    writers: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
-    readers_init_list: std::vec::IntoIter<(EntityId, EntityId, u32)>,
-    writers_init_list: std::vec::IntoIter<(EntityId, EntityId, u32)>,
-    discovered_participant: crate::discovery::SpdpDiscoveredParticipantData,
-) -> Self {
-        Self {
-            readers,
-            writers,
-            readers_init_list,
-            writers_init_list,
-            discovered_participant,
-        }
+  ) -> Self {
+    Self {
+      readers,
+      writers,
+      readers_init_list,
+      writers_init_list,
+      discovered_participant,
     }
+  }
 }
 
 impl Iterator for UpdatedParticipant<'_> {
-    type Item = ((DataStatus, GUID), DomainParticipantStatusEvent);
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some((writer_eid, reader_eid, endpoint)) = self.readers_init_list.next() {
-            // TODO: Caches need to be added here so that proxies can be added to reach the remote endpoints 
-            let Some(writer) = self.writers.get_mut(&writer_eid) else {
-                // ^^ that would be here
-                continue;
-            };
+  type Item = ((DataStatus, GUID), DomainParticipantStatusEvent);
+  fn next(&mut self) -> Option<Self::Item> {
+    while let Some((writer_eid, reader_eid, endpoint)) = self.readers_init_list.next() {
+      // TODO: Caches need to be added here so that proxies can be added to reach the remote endpoints
+      let Some(writer) = self.writers.get_mut(&writer_eid) else {
+        // ^^ that would be here
+        continue;
+      };
 
-            if !self.discovered_participant
-              .available_builtin_endpoints
-              .contains(endpoint) {
-                  continue;
-            }
+      if !self
+        .discovered_participant
+        .available_builtin_endpoints
+        .contains(endpoint)
+      {
+        continue;
+      }
 
-            let reader_proxy = self.discovered_participant.as_reader_proxy(true, Some(reader_eid));
+      let reader_proxy = self
+        .discovered_participant
+        .as_reader_proxy(true, Some(reader_eid));
 
-            // Get the QoS for the built-in topic from the local writer
-            let mut qos = writer.qos();
-            // special case by RTPS 2.3 spec Section
-            // "8.4.13.3 BuiltinParticipantMessageWriter and
-            // BuiltinParticipantMessageReader QoS"
-            if reader_eid == EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_READER
-                && self.discovered_participant
-                .builtin_endpoint_qos
-                .is_some_and(|beq| beq.is_best_effort())
-            {
-                qos.reliability = Some(policy::Reliability::BestEffort);
-            };
+      // Get the QoS for the built-in topic from the local writer
+      let mut qos = writer.qos();
+      // special case by RTPS 2.3 spec Section
+      // "8.4.13.3 BuiltinParticipantMessageWriter and
+      // BuiltinParticipantMessageReader QoS"
+      if reader_eid == EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_READER
+        && self
+          .discovered_participant
+          .builtin_endpoint_qos
+          .is_some_and(|beq| beq.is_best_effort())
+      {
+        qos.reliability = Some(policy::Reliability::BestEffort);
+      };
 
-            let ret = writer.update_reader_proxy(&reader_proxy, &qos);
+      let ret = writer.update_reader_proxy(&reader_proxy, &qos);
 
-            let participant_guid = self.discovered_participant.participant_guid;
+      let participant_guid = self.discovered_participant.participant_guid;
 
-            debug!(
-                "update_discovery writer - endpoint {:?} - {:?}",
-                endpoint, participant_guid
-            );
+      debug!(
+        "update_discovery writer - endpoint {:?} - {:?}",
+        endpoint, participant_guid
+      );
 
-            if let Some((writer, domain)) = ret {
-                let writer_guid = GUID::new(participant_guid.prefix, writer_eid);
-                return Some(((DataStatus::Writer(writer), writer_guid), domain));
-            } else {
-                continue;
-            }
-        }
-
-        while let Some((writer_eid, reader_eid, endpoint)) = self.writers_init_list.next() {
-            let Some(reader) = self.readers.get_mut(&reader_eid) else {
-                continue;
-            };
-
-            debug!("try update_discovery_reader - {:?}", reader.topic_name());
-
-            if !self.discovered_participant
-              .available_builtin_endpoints
-              .contains(endpoint)
-            {
-                continue;
-            }
-
-            let wp = self.discovered_participant.as_writer_proxy(true, Some(writer_eid));
-
-            let qos = reader.qos();
-
-            let ret = reader.update_writer_proxy(wp, &qos);
-            let participant_guid = self.discovered_participant.participant_guid;
-            debug!(
-                "update_discovery_reader - endpoint {:?} - {:?}",
-                endpoint, participant_guid
-            );
-
-            if let Some((reader, domain)) = ret {
-                let reader_guid = GUID::new(participant_guid.prefix, reader_eid);
-                return Some(((DataStatus::Reader(reader), reader_guid), domain));
-            } else {
-                continue;
-            }
-        }
-        None
+      if let Some((writer, domain)) = ret {
+        let writer_guid = GUID::new(participant_guid.prefix, writer_eid);
+        return Some(((DataStatus::Writer(writer), writer_guid), domain));
+      } else {
+        continue;
+      }
     }
+
+    while let Some((writer_eid, reader_eid, endpoint)) = self.writers_init_list.next() {
+      let Some(reader) = self.readers.get_mut(&reader_eid) else {
+        continue;
+      };
+
+      debug!("try update_discovery_reader - {:?}", reader.topic_name());
+
+      if !self
+        .discovered_participant
+        .available_builtin_endpoints
+        .contains(endpoint)
+      {
+        continue;
+      }
+
+      let wp = self
+        .discovered_participant
+        .as_writer_proxy(true, Some(writer_eid));
+
+      let qos = reader.qos();
+
+      let ret = reader.update_writer_proxy(wp, &qos);
+      let participant_guid = self.discovered_participant.participant_guid;
+      debug!(
+        "update_discovery_reader - endpoint {:?} - {:?}",
+        endpoint, participant_guid
+      );
+
+      if let Some((reader, domain)) = ret {
+        let reader_guid = GUID::new(participant_guid.prefix, reader_eid);
+        return Some(((DataStatus::Reader(reader), reader_guid), domain));
+      } else {
+        continue;
+      }
+    }
+    None
+  }
 }
 
 struct UpdatedReadersUpdates<'a, 'b> {
+  writers: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
+  readers_init_list: std::vec::IntoIter<(EntityId, EntityId, u32)>,
+  discovered_participant: &'b crate::discovery::SpdpDiscoveredParticipantData,
+}
+
+impl<'a, 'b> UpdatedReadersUpdates<'a, 'b> {
+  fn new(
     writers: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
     readers_init_list: std::vec::IntoIter<(EntityId, EntityId, u32)>,
     discovered_participant: &'b crate::discovery::SpdpDiscoveredParticipantData,
-}
-
-impl <'a, 'b> UpdatedReadersUpdates<'a, 'b> {
-    fn new(
-        writers: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
-        readers_init_list: std::vec::IntoIter<(EntityId, EntityId, u32)>,
-        discovered_participant: &'b crate::discovery::SpdpDiscoveredParticipantData,
-        ) -> Self {
-
-        Self {
-            writers,
-            readers_init_list,
-            discovered_participant,
-        }
+  ) -> Self {
+    Self {
+      writers,
+      readers_init_list,
+      discovered_participant,
     }
+  }
 }
 
 impl Iterator for UpdatedReadersUpdates<'_, '_> {
-    type Item = (DataWriterStatus, DomainParticipantStatusEvent);
+  type Item = (DataWriterStatus, DomainParticipantStatusEvent);
 
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some((writer_eid, reader_eid, endpoint)) = self.readers_init_list.next() {
-            let Some(writer) = self.writers.get_mut(&writer_eid) else {
-                continue;
-            };
-            if !self.discovered_participant
-              .available_builtin_endpoints
-              .contains(endpoint) {
-                  continue;
-            }
+  fn next(&mut self) -> Option<Self::Item> {
+    while let Some((writer_eid, reader_eid, endpoint)) = self.readers_init_list.next() {
+      let Some(writer) = self.writers.get_mut(&writer_eid) else {
+        continue;
+      };
+      if !self
+        .discovered_participant
+        .available_builtin_endpoints
+        .contains(endpoint)
+      {
+        continue;
+      }
 
-            let reader_proxy = self.discovered_participant.as_reader_proxy(true, Some(reader_eid));
+      let reader_proxy = self
+        .discovered_participant
+        .as_reader_proxy(true, Some(reader_eid));
 
-            // Get the QoS for the built-in topic from the local writer
-            let mut qos = writer.qos();
-            // special case by RTPS 2.3 spec Section
-            // "8.4.13.3 BuiltinParticipantMessageWriter and
-            // BuiltinParticipantMessageReader QoS"
-            if reader_eid == EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_READER
-                && self.discovered_participant
-                .builtin_endpoint_qos
-                .is_some_and(|beq| beq.is_best_effort())
-            {
-                qos.reliability = Some(policy::Reliability::BestEffort);
-            };
+      // Get the QoS for the built-in topic from the local writer
+      let mut qos = writer.qos();
+      // special case by RTPS 2.3 spec Section
+      // "8.4.13.3 BuiltinParticipantMessageWriter and
+      // BuiltinParticipantMessageReader QoS"
+      if reader_eid == EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_READER
+        && self
+          .discovered_participant
+          .builtin_endpoint_qos
+          .is_some_and(|beq| beq.is_best_effort())
+      {
+        qos.reliability = Some(policy::Reliability::BestEffort);
+      };
 
-            let ret = writer.update_reader_proxy(&reader_proxy, &qos);
-            debug!(
-                "update_discovery writer - endpoint {:?} - {:?}",
-                endpoint, self.discovered_participant.participant_guid
-            );
-            if let Some(ret) = ret {
-                return Some(ret);
-            } else {
-                continue;
-            }
-        }
-        None
+      let ret = writer.update_reader_proxy(&reader_proxy, &qos);
+      debug!(
+        "update_discovery writer - endpoint {:?} - {:?}",
+        endpoint, self.discovered_participant.participant_guid
+      );
+      if let Some(ret) = ret {
+        return Some(ret);
+      } else {
+        continue;
+      }
     }
+    None
+  }
 }
-
 
 // -----------------------------------------------------------
 // -----------------------------------------------------------

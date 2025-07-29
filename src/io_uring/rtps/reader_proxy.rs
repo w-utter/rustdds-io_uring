@@ -65,13 +65,18 @@ pub(crate) struct RtpsReaderProxy {
 }
 
 impl RtpsReaderProxy {
-  pub fn new(remote_reader_guid: GUID, qos: QosPolicies, expects_in_line_qos: bool) -> Self {
+  pub fn new(
+    remote_reader_guid: GUID,
+    qos: QosPolicies,
+    unicast_locator_list: Vec<Locator>,
+    multicast_locator_list: Vec<Locator>,
+  ) -> Self {
     Self {
       remote_reader_guid,
       remote_group_entity_id: EntityId::UNKNOWN,
-      unicast_locator_list: Vec::default(),
-      multicast_locator_list: Vec::default(),
-      expects_in_line_qos,
+      unicast_locator_list,
+      multicast_locator_list,
+      expects_in_line_qos: false,
       is_active: true,
       all_acked_before: SequenceNumber::zero(),
       unsent_changes: BTreeSet::new(),
@@ -151,8 +156,8 @@ impl RtpsReaderProxy {
   }
 
   pub fn from_reader(reader: &ReaderIngredients, domain_participant: &DomainParticipant) -> Self {
-      todo!("reader proxy from reader");
-      /*
+    todo!("reader proxy from reader");
+    /*
     let mut self_locators = domain_participant.self_locators(); // This clones a map of locator lists.
     let unicast_locator_list = self_locators
       .remove(&USER_TRAFFIC_LISTENER_TOKEN)

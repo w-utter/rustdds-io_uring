@@ -14,6 +14,7 @@ use crate::{
   GUID,
 };
 
+use crate::TopicCache;
 use crate::io_uring::dds::with_key::datareader as datareader_with_key;
 
 use crate::no_key::wrappers::{DAWrapper, NoKeyWrapper};
@@ -99,9 +100,12 @@ where
     &mut self,
     max_samples: usize,
     read_condition: ReadCondition,
+    topic_cache: &mut TopicCache,
   ) -> ReadResult<Vec<DataSample<&D>>> {
     let values: Vec<WithKeyDataSample<&NoKeyWrapper<D>>> =
-      self.keyed_datareader.read(max_samples, read_condition)?;
+      self
+        .keyed_datareader
+        .read(max_samples, read_condition, topic_cache)?;
     let mut result = Vec::with_capacity(values.len());
     for ks in values {
       if let Some(s) = DataSample::<D>::from_with_key_ref(ks) {
@@ -144,9 +148,12 @@ where
     &mut self,
     max_samples: usize,
     read_condition: ReadCondition,
+    topic_cache: &mut TopicCache,
   ) -> ReadResult<Vec<DataSample<D>>> {
     let values: Vec<WithKeyDataSample<NoKeyWrapper<D>>> =
-      self.keyed_datareader.take(max_samples, read_condition)?;
+      self
+        .keyed_datareader
+        .take(max_samples, read_condition, topic_cache)?;
     let mut result = Vec::with_capacity(values.len());
     for ks in values {
       if let Some(s) = DataSample::<D>::from_with_key(ks) {
@@ -181,8 +188,11 @@ where
   ///   // Do something
   /// }
   /// ```
-  pub fn read_next_sample(&mut self) -> ReadResult<Option<DataSample<&D>>> {
-    let mut ds = self.read(1, ReadCondition::not_read())?;
+  pub fn read_next_sample(
+    &mut self,
+    topic_cache: &mut TopicCache,
+  ) -> ReadResult<Option<DataSample<&D>>> {
+    let mut ds = self.read(1, ReadCondition::not_read(), topic_cache)?;
     Ok(ds.pop())
   }
 
@@ -211,8 +221,11 @@ where
   ///   // Do something
   /// }
   /// ```
-  pub fn take_next_sample(&mut self) -> ReadResult<Option<DataSample<D>>> {
-    let mut ds = self.take(1, ReadCondition::not_read())?;
+  pub fn take_next_sample(
+    &mut self,
+    topic_cache: &mut TopicCache,
+  ) -> ReadResult<Option<DataSample<D>>> {
+    let mut ds = self.take(1, ReadCondition::not_read(), topic_cache)?;
     Ok(ds.pop())
   }
 
@@ -245,12 +258,12 @@ where
   ///   // Do something
   /// }
   /// ```
-  pub fn iterator(&mut self) -> ReadResult<impl Iterator<Item = &D>> {
+  pub fn iterator(&mut self, topic_cache: &mut TopicCache) -> ReadResult<impl Iterator<Item = &D>> {
     // TODO: We could come up with a more efficient implementation than wrapping a
     // read call
     Ok(
       self
-        .read(usize::MAX, ReadCondition::not_read())?
+        .read(usize::MAX, ReadCondition::not_read(), topic_cache)?
         .into_iter()
         .map(|ds| ds.value),
     )
@@ -285,12 +298,13 @@ where
   pub fn conditional_iterator(
     &mut self,
     read_condition: ReadCondition,
+    topic_cache: &mut TopicCache,
   ) -> ReadResult<impl Iterator<Item = &D>> {
     // TODO: We could come up with a more efficient implementation than wrapping a
     // read call
     Ok(
       self
-        .read(usize::MAX, read_condition)?
+        .read(usize::MAX, read_condition, topic_cache)?
         .into_iter()
         .map(|ds| ds.value),
     )
@@ -325,12 +339,15 @@ where
   ///   // Do something
   /// }
   /// ```
-  pub fn into_iterator(&mut self) -> ReadResult<impl Iterator<Item = D>> {
+  pub fn into_iterator(
+    &mut self,
+    topic_cache: &mut TopicCache,
+  ) -> ReadResult<impl Iterator<Item = D>> {
     // TODO: We could come up with a more efficient implementation than wrapping a
     // read call
     Ok(
       self
-        .take(usize::MAX, ReadCondition::not_read())?
+        .take(usize::MAX, ReadCondition::not_read(), topic_cache)?
         .into_iter()
         .map(|ds| ds.value),
     )
@@ -367,12 +384,13 @@ where
   pub fn into_conditional_iterator(
     &mut self,
     read_condition: ReadCondition,
+    topic_cache: &mut TopicCache,
   ) -> ReadResult<impl Iterator<Item = D>> {
     // TODO: We could come up with a more efficient implementation than wrapping a
     // read call
     Ok(
       self
-        .take(usize::MAX, read_condition)?
+        .take(usize::MAX, read_condition, topic_cache)?
         .into_iter()
         .map(|ds| ds.value),
     )

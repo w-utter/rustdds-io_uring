@@ -21,10 +21,7 @@ use crate::{
 use crate::io_uring::rtps::reader::Reader;
 use crate::io_uring::timer::timer_state;
 
-use crate::rtps::message_receiver::{
-    SecureReceiverState, 
-    MessageReceiverState, 
-};
+use crate::rtps::message_receiver::{SecureReceiverState, MessageReceiverState};
 
 #[cfg(feature = "security")]
 use crate::rtps::message_receiver::SecureWrapping;
@@ -46,82 +43,91 @@ use crate::structure::sequence_number::SequenceNumber;
 const RTPS_MESSAGE_HEADER_SIZE: usize = 20;
 
 pub enum SubmessageSideEffect {
-    AckNack(GuidPrefix, AckSubmessage),
-    SpdpLiveness(GuidPrefix),
+  AckNack(GuidPrefix, AckSubmessage),
+  SpdpLiveness(GuidPrefix),
 }
 
 #[derive(Debug)]
 pub enum PassedSubmessage {
-    Reader(ReaderSubmessage, GuidPrefix),
-    Writer(WriterSubmessage),
+  Reader(ReaderSubmessage, GuidPrefix),
+  Writer(WriterSubmessage),
 }
 
 pub struct SubmessageIter2<'a> {
-    pub(crate) msg_recv: &'a mut MessageReceiver,
-    submsgs: std::vec::IntoIter<Submessage>,
+  pub(crate) msg_recv: &'a mut MessageReceiver,
+  submsgs: std::vec::IntoIter<Submessage>,
 }
 
-impl <'a> SubmessageIter2<'a> {
-    fn new(msg_recv: &'a mut MessageReceiver, submsgs: std::vec::IntoIter<Submessage>) -> Self {
-        Self {
-            msg_recv,
-            submsgs,
-        }
+impl<'a> SubmessageIter2<'a> {
+  fn new(msg_recv: &'a mut MessageReceiver, submsgs: std::vec::IntoIter<Submessage>) -> Self {
+    Self { msg_recv, submsgs }
+  }
+}
+
+impl<'a> Iterator for SubmessageIter2<'a> {
+  type Item = PassedSubmessage;
+  fn next(&mut self) -> Option<Self::Item> {
+    let sub_msg = self.submsgs.next()?;
+    self.msg_recv.submessage_count += 1;
+
+    if matches!(
+      &sub_msg.body,
+      /*SubmessageBody::Writer(_) |*/ SubmessageBody::Reader(_)
+    ) {
+      //println!("\n{sub_msg:?}\n");
     }
-}
 
-impl <'a> Iterator for SubmessageIter2<'a> {
-    type Item = PassedSubmessage;
-    fn next(&mut self) -> Option<Self::Item> {
-        let sub_msg = self.submsgs.next()?;
-        self.msg_recv.submessage_count += 1;
-
-        match sub_msg.body {
-          SubmessageBody::Interpreter(m) => {
-              self.msg_recv.handle_interpreter_submessage(m);
-              self.next()
-          }
-          SubmessageBody::Writer(msg) => {
-              if self.msg_recv.dest_guid_prefix != self.msg_recv.own_guid_prefix && self.msg_recv.dest_guid_prefix != GuidPrefix::UNKNOWN {
-                  debug!(
-                    "Message is not for this participant. Dropping. dest_guid_prefix={:?} participant \
+    match sub_msg.body {
+      SubmessageBody::Interpreter(m) => {
+        self.msg_recv.handle_interpreter_submessage(m);
+        self.next()
+      }
+      SubmessageBody::Writer(msg) => {
+        if self.msg_recv.dest_guid_prefix != self.msg_recv.own_guid_prefix
+          && self.msg_recv.dest_guid_prefix != GuidPrefix::UNKNOWN
+        {
+          debug!(
+            "Message is not for this participant. Dropping. dest_guid_prefix={:?} participant \
                      guid={:?}",
-                    self.msg_recv.dest_guid_prefix, self.msg_recv.own_guid_prefix
-                  );
-                  return self.next();
-              }
-
-              Some(PassedSubmessage::Writer(msg))
-          }
-          SubmessageBody::Reader(submsg) => {
-              let source_guid_prefix = self.msg_recv.source_guid_prefix;
-              match self.msg_recv.security_plugins.as_ref() {
-                  #[cfg(not(feature = "security"))]
-                  Some(_) => Some(PassedSubmessage::Reader(submsg, source_guid_prefix)),
-                  None => Some(PassedSubmessage::Reader(submsg, source_guid_prefix)),
-                  #[cfg(feature = "security")]
-                  Some(security) => {
-                      let destination_guid = GUID {
-                          prefix: self.msg_recv.dest_guid_prefix,
-                          entity_id: submsg.receiver_entity_id(),
-                      };
-                      if security.get_plugins().submessage_not_protected(&destination_guid) {
-                          Some(PassedSubmessage::Reader(submsg, source_guid_prefix))
-                      } else {
-                          error!(
-                            "No writer with unprotected submessages found for the GUID \
-                             {destination_guid:?}"
-                          );
-                          self.next()
-                      }
-                  }
-              }
-          }
-          //TODO: add security support later
-          //this wold still allow for only reader/writer submsgs to be passed along
-          _ => None,
+            self.msg_recv.dest_guid_prefix, self.msg_recv.own_guid_prefix
+          );
+          return self.next();
         }
+
+        Some(PassedSubmessage::Writer(msg))
+      }
+      SubmessageBody::Reader(submsg) => {
+        let source_guid_prefix = self.msg_recv.source_guid_prefix;
+        match self.msg_recv.security_plugins.as_ref() {
+          #[cfg(not(feature = "security"))]
+          Some(_) => Some(PassedSubmessage::Reader(submsg, source_guid_prefix)),
+          None => Some(PassedSubmessage::Reader(submsg, source_guid_prefix)),
+          #[cfg(feature = "security")]
+          Some(security) => {
+            let destination_guid = GUID {
+              prefix: self.msg_recv.dest_guid_prefix,
+              entity_id: submsg.receiver_entity_id(),
+            };
+            if security
+              .get_plugins()
+              .submessage_not_protected(&destination_guid)
+            {
+              Some(PassedSubmessage::Reader(submsg, source_guid_prefix))
+            } else {
+              error!(
+                "No writer with unprotected submessages found for the GUID \
+                             {destination_guid:?}"
+              );
+              self.next()
+            }
+          }
+        }
+      }
+      //TODO: add security support later
+      //this wold still allow for only reader/writer submsgs to be passed along
+      _ => None,
     }
+  }
 }
 
 /// [`MessageReceiver`] is the submessage sequence interpreter described in
@@ -131,7 +137,7 @@ impl <'a> Iterator for SubmessageIter2<'a> {
 /// SUbmessages and forwards data in Entity Submessages to the appropriate
 /// Entities. (See RTPS spec Section 8.3.7)
 pub struct MessageReceiver {
-    //TODO: remove
+  //TODO: remove
   pub available_readers: BTreeMap<EntityId, Reader<timer_state::Init>>,
   // GuidPrefix sent in this channel needs to be RTPSMessage source_guid_prefix. Writer needs this
   // to locate RTPSReaderProxy if negative acknack.
@@ -235,10 +241,10 @@ impl MessageReceiver {
     self.available_readers.get_mut(&reader_id)
   }
 
-  // TODO: change this to an iterator over the messages that arent interpreted.
-  // also, make the partial clone a reference to the locator list instead of cloning the vec unless
-  // necessary.
-  pub fn handle_received_packet<'a, 'b, 'c>(&'a mut self, msg_bytes: &Bytes, ring: &'b mut io_uring::IoUring, topic_cache: &'c mut TopicCache) -> Option<impl Iterator<Item = SubmessageSideEffect> + use<'a, 'b, 'c>> {
+  pub fn handle_received_packet_2<'a>(
+    &'a mut self,
+    msg_bytes: &Bytes,
+  ) -> Option<SubmessageIter2<'a>> {
     // Check for RTPS ping message. At least RTI implementation sends these.
     // What should we do with them? The spec does not say.
     if msg_bytes.len() < RTPS_MESSAGE_HEADER_SIZE {
@@ -287,138 +293,13 @@ impl MessageReceiver {
       }
     };
 
-    Some(self.handle_parsed_message(rtps_message, ring, topic_cache))
-  }
-
-  pub fn handle_received_packet_2<'a>(&'a mut self, msg_bytes: &Bytes) -> Option<SubmessageIter2<'a>> {
-    // Check for RTPS ping message. At least RTI implementation sends these.
-    // What should we do with them? The spec does not say.
-    if msg_bytes.len() < RTPS_MESSAGE_HEADER_SIZE {
-      if msg_bytes.len() >= 16
-        && msg_bytes[0..4] == b"RTPS"[..]
-        && msg_bytes[9..16] == b"DDSPING"[..]
-      {
-        // TODO: Add some sensible ping message handling here.
-        info!("Received RTPS PING. Do not know how to respond.");
-        debug!("Data was {:?}", &msg_bytes);
-      } else {
-        warn!("Message is shorter than RTPS header. Cannot deserialize.");
-        debug!("Data was {:?}", &msg_bytes);
-      }
-      return None;
-    }
-
-    // Check that the 4-byte magic string matches "RTPS"
-    if msg_bytes.len() >= 4 {
-      let magic = &msg_bytes[0..4];
-      if *magic == b"RTPS"[..] {
-        // go ahead and try to decode message
-      } else if *magic == b"RTPX"[..] {
-        // RTI Connext sends also packets with magic RTPX in the header.
-        // We do not know are these really same as RTPS or different, so let's
-        // ignore those.
-        info!("Received message with RTPX header. Ignoring.");
-        return None;
-      } else {
-        warn!(
-          "Received message with unknown start of header {:x?}. Ignoring.",
-          magic
-        );
-        return None;
-      }
-    }
-
-    // call Speedy reader
-    // Bytes .clone() is cheap, so no worries
-    let rtps_message = match Message::read_from_buffer(msg_bytes) {
-      Ok(m) => m,
-      Err(speedy_err) => {
-        warn!("RTPS deserialize error {:?}", speedy_err);
-        debug!("Data was {:?}", msg_bytes);
-        return None;
-      }
-    };
+    //println!("\n{rtps_message:?}\n");
 
     Some(self.handle_parsed_message_2(rtps_message))
   }
 
-  // This is also called directly from dp_event_loop in case of loopback messages.
-  // this should return an iterator over Spdp / acknack messages.
-  pub fn handle_parsed_message<'a, 'b, 'c>(&'a mut self, rtps_message: Message, ring: &'b mut io_uring::IoUring, topic_cache: &'c mut TopicCache) -> impl Iterator<Item = SubmessageSideEffect> + use<'a, 'b, 'c> {
-    self.reset();
-    self.dest_guid_prefix = self.own_guid_prefix;
-    self.source_guid_prefix = rtps_message.header.guid_prefix;
-    self.source_version = rtps_message.header.protocol_version;
-    self.source_vendor_id = rtps_message.header.vendor_id;
-
-    #[cfg(not(feature = "security"))]
-    let decoded_message = rtps_message;
-
-    #[cfg(feature = "security")]
-    let decoded_message = match &self.security_plugins {
-      None => {
-        self.must_be_rtps_protection_special_case = false; // No plugins, no protection
-        rtps_message
-      }
-
-      Some(security_plugins_handle) => {
-        let security_plugins = security_plugins_handle.get_plugins();
-
-        // If the first submessage is SecureRTPSPrefix, the message has to be decoded
-        // using the cryptographic plugin
-        if let Some(Submessage {
-          body: SubmessageBody::Security(SecuritySubmessage::SecureRTPSPrefix(..)),
-          ..
-        }) = rtps_message.submessages.first()
-        {
-          match security_plugins.decode_rtps_message(rtps_message, &self.source_guid_prefix) {
-            Ok(DecodeOutcome::Success(message)) => {
-              self.must_be_rtps_protection_special_case = false; // Message was protected
-              message
-            }
-            Ok(DecodeOutcome::KeysNotFound(header_key_id)) => {
-              return trace!(
-                "No matching message decode keys found for the key id {:?} for the remote \
-                 participant {:?}",
-                header_key_id,
-                self.source_guid_prefix
-              )
-            }
-            Ok(DecodeOutcome::ValidatingReceiverSpecificMACFailed) => {
-              return trace!("Failed to validate the receiver-specif MAC for the rtps message.");
-            }
-            Ok(DecodeOutcome::ParticipantCryptoHandleNotFound(guid_prefix)) => {
-              return trace!(
-                "No participant crypto handle found for the participant {:?} for rtps message \
-                 decoding.",
-                guid_prefix
-              )
-            }
-            Err(e) => return error!("{e:?}"),
-          }
-        } else {
-          if security_plugins.rtps_not_protected(&self.dest_guid_prefix) {
-            // The domain is not rtps-protected, the additional check does not apply
-            self.must_be_rtps_protection_special_case = false;
-          } else {
-            // The messages in a rtps-protected domain are expected to start
-            // with SecureRTPSPrefix. The only exception is if the
-            // message contains only submessages for the following
-            // builtin topics: DCPSParticipants,
-            // DCPSParticipantStatelessMessage,
-            // DCPSParticipantVolatileMessageSecure
-            // (8.4.2.4, table 27).
-            self.must_be_rtps_protection_special_case = true;
-          }
-          rtps_message
-        }
-      }
-    };
-
-    SubmessageIter::new(self, decoded_message.submessages, ring, topic_cache)
-  }
-
   pub fn handle_parsed_message_2<'a>(&'a mut self, rtps_message: Message) -> SubmessageIter2<'a> {
+    //println!("\n{rtps_message:?}\n");
     self.reset();
     self.dest_guid_prefix = self.own_guid_prefix;
     self.source_guid_prefix = rtps_message.header.guid_prefix;
@@ -492,245 +373,17 @@ impl MessageReceiver {
     SubmessageIter2::new(self, decoded_message.submessages.into_iter())
   }
 
-  fn handle_submessage(&mut self, submessage: Submessage, sub_iter: &mut Option<(TargetReaderEntityIdIter, WriterSubmessage)>, ring: &mut io_uring::IoUring, topic_cache: &mut TopicCache) -> Option<SubmessageSideEffect> {
-    match self.secure_receiver_state.take() {
-      // Note that .take() always resets the state to "None", so we must
-      // set it in every branch where it should remain in some other value.
-      None => {
-        // Just normal, non-security processing
-        match submessage.body {
-          SubmessageBody::Interpreter(m) => {
-              self.handle_interpreter_submessage(m);
-              return None
-          }
-          SubmessageBody::Writer(submessage) => {
-            let security_plugins_clone = self.security_plugins.clone();
-            let receiver_entity_id = submessage.receiver_entity_id();
-            println!("writer with id: {receiver_entity_id:?}");
-
-            // For writer submessages, if the receiver entity ID is unknown, we have to try
-            // to give it to all matched readers. When security is enabled, we do this for
-            // topics that have no submessage protection
-            if receiver_entity_id == EntityId::UNKNOWN {
-              let sending_writer_entity_id = submessage.sender_entity_id();
-              println!("sending writer has id: {sending_writer_entity_id:?}");
-
-              let available_target_entity_ids: Vec<EntityId> = self
-                .available_readers
-                .values()
-                .filter(|target_reader| {
-                  // Reader must contain the writer
-                  target_reader.contains_writer(sending_writer_entity_id)
-                    // But there are two exceptions:
-                    // 1. SPDP reader must read from unknown SPDP writers
-                    //  TODO: This logic here is uglyish. Can we just inject a
-                    //  presupposed writer (proxy) to the built-in reader as it is created?
-                    || (sending_writer_entity_id == EntityId::SPDP_BUILTIN_PARTICIPANT_WRITER
-                      && target_reader.entity_id() == EntityId::SPDP_BUILTIN_PARTICIPANT_READER)
-                    // 2. ParticipantStatelessReader does not contain any writers, since it is stateless
-                    || (sending_writer_entity_id == EntityId::P2P_BUILTIN_PARTICIPANT_STATELESS_WRITER
-                      && target_reader.entity_id() == EntityId::P2P_BUILTIN_PARTICIPANT_STATELESS_READER)
-                })
-                .map(Reader::entity_id).collect();
-
-              match security_plugins_clone {
-                None => {
-                    let mut iter = available_target_entity_ids.into_iter();
-
-                    let ret = iter.next().map(|target_id| {
-                        self.handle_writer_submessage(target_id, submessage.clone(), ring, topic_cache)
-                    });
-
-                    *sub_iter = Some((iter.into(), submessage));
-                    return ret?;
-                }
-
-                #[cfg(not(feature = "security"))]
-                Some(_) => {
-                    return None;
-                }
-
-                #[cfg(feature = "security")]
-                Some(plugins_handle) => {
-                    let mut iter = available_target_entity_ids.into_iter();
-
-                    let ret = iter.next().map(|target_id| {
-                        let destination_guid = GUID {
-                          prefix: self.dest_guid_prefix,
-                          entity_id: target_entity_id,
-                        };
-                        if plugins_handle.get_plugins().submessage_not_protected(&destination_guid) {
-                            self.handle_writer_submessage(target_id, submessage.clone())
-                        } else {
-                            None
-                        }
-                    });
-
-                    *sub_iter = Some((iter.into(), submessage));
-                    return ret?;
-                }
-              }
-            } else {
-              match security_plugins_clone {
-                None => {
-                    return self.handle_writer_submessage(receiver_entity_id, submessage, ring, topic_cache);
-                }
-
-                #[cfg(not(feature = "security"))]
-                Some(_) => {
-                    return None;
-                }
-
-                #[cfg(feature = "security")]
-                Some(plugins_handle) => {
-                  let destination_guid = GUID {
-                    prefix: self.dest_guid_prefix,
-                    entity_id: receiver_entity_id,
-                  };
-                  if plugins_handle
-                    .get_plugins()
-                    .submessage_not_protected(&destination_guid)
-                  {
-                    return self.handle_writer_submessage(receiver_entity_id, submessage);
-                  } else {
-                    error!(
-                      "No reader with unprotected submessages found for the GUID {:?}",
-                      destination_guid
-                    );
-                    return None;
-                  }
-                }
-              }
-            }
-          }
-
-          SubmessageBody::Reader(submessage) => {
-            #[cfg(not(feature = "security"))]
-            {
-              return self.handle_reader_submessage(submessage);
-            }
-            #[cfg(feature = "security")]
-            match self
-              .security_plugins
-              .as_ref()
-              .map(SecurityPluginsHandle::get_plugins)
-            {
-              None => return self.handle_reader_submessage(submessage),
-              Some(plugins) => {
-                let destination_guid = GUID {
-                  prefix: self.dest_guid_prefix,
-                  entity_id: submessage.receiver_entity_id(),
-                };
-                #[cfg(feature = "security")]
-                // This match branch can only be taken with security feature
-                if plugins.submessage_not_protected(&destination_guid) {
-                  return self.handle_reader_submessage(submessage);
-                } else {
-                  error!(
-                    "No writer with unprotected submessages found for the GUID {:?}",
-                    destination_guid
-                  );
-                  return None;
-                }
-              }
-            }
-          }
-
-          #[cfg(feature = "security")]
-          SubmessageBody::Security(m) => {
-            if self.dest_guid_prefix != self.own_guid_prefix
-              && self.dest_guid_prefix != GuidPrefix::UNKNOWN
-            {
-              trace!(
-                "Message is not for this participant. Dropping. dest_guid_prefix={:?} participant \
-                 guid={:?}",
-                self.dest_guid_prefix,
-                self.own_guid_prefix
-              );
-              return None;
-            } else {
-              match m {
-                SecuritySubmessage::SecureBody(_sec_body, _sec_body_flags) => {
-                  warn!("SecureBody submessage without SecurePrefix. Discarding.");
-                  return None;
-                }
-                SecuritySubmessage::SecurePrefix(sec_prefix, _) => {
-                  // just store secure prefix
-                  self.secure_receiver_state = Some(SecureReceiverState::Prefix(sec_prefix));
-                  return None;
-                }
-                SecuritySubmessage::SecurePostfix(_sec_postfix, _sec_postfix_flags) => {
-                  warn!("SecurePostfix submessage out of sequence. Discarding.");
-                  return None;
-                }
-                SecuritySubmessage::SecureRTPSPrefix(..) => {
-                  // DDS Security spec Section "7.3.6.6.3 Validity" requires that this is the
-                  // first submessage in a message, in which case it has been taken care of by
-                  // decode_rtps_message
-                  warn!(
-                    "SecureRTPSPrefix is only allowed at the start of the message, now received \
-                     at count={}.",
-                    self.submessage_count
-                  );
-                  return None;
-                }
-                SecuritySubmessage::SecureRTPSPostfix(
-                  _sec_rtps_postfix,
-                  _sec_rtps_postfix_flags,
-                ) => {
-                  warn!("SecureRTPSPostfix submessage out of sequence. Discarding.");
-                  return None;
-                }
-              } // match
-            } // if
-          }
-        } // match submessage kind
-      } // state None
-
-      #[cfg(not(feature = "security"))]
-      Some(_) => {
-          return None;
-      }
-      // No security feature => secure_receiver_state is always None.
-      #[cfg(feature = "security")]
-      Some(SecureReceiverState::Prefix(sec_prefix)) => {
-        self.secure_receiver_state = Some(SecureReceiverState::SecureSubmessage(
-          sec_prefix, submessage,
-        ));
-        return None;
-      } // state Prefix
-
-      #[cfg(feature = "security")]
-      Some(SecureReceiverState::SecureSubmessage(sec_prefix, sec_submessage)) => {
-        // Secure prefix and a single other submessage received.
-        // Now expecting postfix, and only that.
-        match submessage.body {
-          SubmessageBody::Security(SecuritySubmessage::SecurePostfix(sec_postfix, _)) => {
-            self.handle_secure_submessage(&sec_prefix, &sec_submessage, &sec_postfix);
-            return None;
-          }
-          other => {
-            warn!(
-              "Expected SecurePostfix submessage after SecurePrefix and payload submessage. \
-               Discarding."
-            );
-            debug!("Unexpected submessage instead: {other:?}");
-            return None;
-          }
-        }
-      } // state SecureSubmessage
-    } // match secure_submessage_state
-  } // fn
-
   fn handle_writer_submessage(
     &mut self,
     target_reader_entity_id: EntityId,
     submessage: WriterSubmessage,
+    udp_sender: &UDPSender,
     ring: &mut io_uring::IoUring,
     topic_cache: &mut TopicCache,
   ) -> Option<SubmessageSideEffect> {
     if self.dest_guid_prefix != self.own_guid_prefix && self.dest_guid_prefix != GuidPrefix::UNKNOWN
     {
+      //println!("\nmessage not meant for this participant\n");
       debug!(
         "Message is not for this participant. Dropping. dest_guid_prefix={:?} participant \
          guid={:?}",
@@ -790,7 +443,7 @@ impl MessageReceiver {
         if writer_entity_id == EntityId::SPDP_BUILTIN_PARTICIPANT_WRITER
           && target_reader_entity_id == EntityId::SPDP_BUILTIN_PARTICIPANT_READER
         {
-            return Some(SubmessageSideEffect::SpdpLiveness(source_guid_prefix));
+          return Some(SubmessageSideEffect::SpdpLiveness(source_guid_prefix));
         }
         return None;
       }
@@ -800,6 +453,7 @@ impl MessageReceiver {
           &heartbeat,
           flags.contains(HEARTBEAT_Flags::Final),
           &mr_state,
+          udp_sender,
           ring,
           topic_cache,
         );
@@ -1024,12 +678,15 @@ impl MessageReceiver {
 
     match submessage {
       ReaderSubmessage::AckNack(acknack, _) => {
-        return Some(SubmessageSideEffect::AckNack(self.source_guid_prefix, AckSubmessage::AckNack(acknack)))
+        return Some(SubmessageSideEffect::AckNack(
+          self.source_guid_prefix,
+          AckSubmessage::AckNack(acknack),
+        ))
       }
 
       ReaderSubmessage::NackFrag(_, _) => {
         // TODO: Implement NackFrag handling
-          return None
+        return None;
       }
     }
   }
@@ -1112,7 +769,8 @@ impl MessageReceiver {
                   &receiver_guid,
                 )
               {
-                return self.handle_writer_submessage(receiver_entity_id, decoded_writer_submessage);
+                return self
+                  .handle_writer_submessage(receiver_entity_id, decoded_writer_submessage);
               } else {
                 error!("Destination GUID did not match the handle used for decoding.");
                 return None;
@@ -1225,7 +883,7 @@ impl MessageReceiver {
   // sends 0 seqnum acknacks for those writer that haven't had any action
   pub fn send_preemptive_acknacks(&mut self, udp_sender: &UDPSender, ring: &mut io_uring::IoUring) {
     for reader in self.available_readers.values_mut() {
-      reader.send_preemptive_acknacks(ring);
+      reader.send_preemptive_acknacks(udp_sender, ring);
     }
   }
 
@@ -1301,7 +959,7 @@ mod tests {
   #[test]
 
   fn test_shapes_demo_message_deserialization() {
-      let mut ring = io_uring::IoUring::new(16).expect("no ring");
+    let mut ring = io_uring::IoUring::new(16).expect("no ring");
     // The following message bytes contain serialized INFO_DST, INFO_TS, DATA &
     // HEARTBEAT submessages. The DATA submessage contains a ShapeType value.
     // The bytes have been captured from WireShark.
@@ -1331,10 +989,7 @@ mod tests {
     );
 
     // Create a message receiver
-    let mut message_receiver = MessageReceiver::new(
-      target_gui_prefix,
-      None,
-    );
+    let mut message_receiver = MessageReceiver::new(target_gui_prefix, None);
 
     // Create a reader to process the message
     let entity =
@@ -1363,7 +1018,9 @@ mod tests {
     let mut new_reader = Reader::new(
       reader_ing,
       Rc::new(UDPSender::new_with_random_port().unwrap()),
-    ).register(&mut ring, 0).unwrap();
+    )
+    .register(&mut ring, 0)
+    .unwrap();
 
     // Add info of the writer to the reader
     new_reader.matched_writer_add(
@@ -1377,10 +1034,11 @@ mod tests {
     // Add reader to message reader and process the bytes message
     message_receiver.add_reader(new_reader);
 
-    let res = message_receiver.handle_received_packet(&udp_bits1, &mut ring, &mut topic_cache).expect("could not parse bits");
+    let res = message_receiver
+      .handle_received_packet(&udp_bits1, &mut ring, &mut topic_cache)
+      .expect("could not parse bits");
 
-    for _a in res {
-    }
+    for _a in res {}
 
     // Verify the message reader has recorded the right amount of submessages
     assert_eq!(message_receiver.submessage_count, 4);
@@ -1420,7 +1078,7 @@ mod tests {
 
   #[test]
   fn mr_test_submsg_count() {
-      let mut ring = io_uring::IoUring::new(16).expect("no ring");
+    let mut ring = io_uring::IoUring::new(16).expect("no ring");
     // Udp packet with INFO_DST, INFO_TS, DATA, HEARTBEAT
     let udp_bits1 = Bytes::from_static(&[
       0x52, 0x54, 0x50, 0x53, 0x02, 0x03, 0x01, 0x0f, 0x01, 0x0f, 0x99, 0x06, 0x78, 0x34, 0x00,
@@ -1442,7 +1100,6 @@ mod tests {
       0x03, 0x00, 0x00, 0x00,
     ]);
 
-
     let mut dds_cache = DDSCache::new();
     let qos_policy = QosPolicies::qos_none();
 
@@ -1455,17 +1112,18 @@ mod tests {
     let mut topic_cache = topic_cache_handle.lock().unwrap();
 
     let guid_new = GUID::default();
-    let mut message_receiver =
-      MessageReceiver::new(guid_new.prefix, None);
+    let mut message_receiver = MessageReceiver::new(guid_new.prefix, None);
 
-    let mut res = message_receiver.handle_received_packet(&udp_bits1, &mut ring, &mut topic_cache).expect("could not parse udp bits");
-    for _a in res {
-    }
+    let mut res = message_receiver
+      .handle_received_packet(&udp_bits1, &mut ring, &mut topic_cache)
+      .expect("could not parse udp bits");
+    for _a in res {}
     assert_eq!(message_receiver.submessage_count, 4);
 
-    let mut res_2 = message_receiver.handle_received_packet(&udp_bits2, &mut ring, &mut topic_cache).expect("could not parse udp bits");
-    for _a in res_2 {
-    }
+    let mut res_2 = message_receiver
+      .handle_received_packet(&udp_bits2, &mut ring, &mut topic_cache)
+      .expect("could not parse udp bits");
+    for _a in res_2 {}
     assert_eq!(message_receiver.submessage_count, 2);
   }
 
@@ -1481,87 +1139,18 @@ mod tests {
 }
 
 struct TargetReaderEntityIdIter {
-    iter: std::vec::IntoIter<EntityId>,
+  iter: std::vec::IntoIter<EntityId>,
 }
 
 impl From<std::vec::IntoIter<EntityId>> for TargetReaderEntityIdIter {
-    fn from(iter: std::vec::IntoIter<EntityId>) -> TargetReaderEntityIdIter {
-        Self {
-            iter
-        }
-    }
+  fn from(iter: std::vec::IntoIter<EntityId>) -> TargetReaderEntityIdIter {
+    Self { iter }
+  }
 }
 
 impl Iterator for TargetReaderEntityIdIter {
-    type Item = EntityId;
-    fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next()
-    }
+  type Item = EntityId;
+  fn next(&mut self) -> Option<Self::Item> {
+    self.iter.next()
+  }
 }
-
-pub(crate) struct SubmessageIter<'a, 'b, 'c> {
-    msg_recv: &'a mut MessageReceiver,
-    writer_iter: Option<(TargetReaderEntityIdIter, WriterSubmessage)>,
-    submsgs: std::vec::IntoIter<Submessage>,
-    ring: &'b mut io_uring::IoUring,
-    topic_cache: &'c mut TopicCache,
-}
-
-impl <'a, 'b, 'c> SubmessageIter<'a, 'b, 'c> {
-    fn new(receiver: &'a mut MessageReceiver, submsgs: Vec<Submessage>, ring: &'b mut io_uring::IoUring, topic_cache: &'c mut TopicCache) -> Self {
-        Self {
-            msg_recv: receiver,
-            submsgs: submsgs.into_iter(),
-            writer_iter: None,
-            ring,
-            topic_cache,
-        }
-    }
-}
-
-impl Iterator for SubmessageIter<'_, '_, '_> {
-    type Item = SubmessageSideEffect;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some((iter, writer_msg)) = self.writer_iter.as_mut() {
-            println!("writer!");
-            while let Some(target_reader) = iter.next() {
-                #[cfg(not(feature = "security"))]
-                let cond = true;
-                #[cfg(feature = "security")]
-                let cond = match &self.security_plugins {
-                    None => false,
-                    Some(plugins_handle) => {
-                        let destination_guid = GUID {
-                          prefix: self.msg_recv.dest_guid_prefix,
-                          entity_id: target_reader,
-                        };
-
-                        plugins_handle.get_plugins().submessage_not_protected(&destination_guid)
-                    }
-                };
-
-                if cond {
-                    if let Some(ret) = self.msg_recv.handle_writer_submessage(target_reader, writer_msg.clone(), self.ring, self.topic_cache) {
-                        return Some(ret);
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
-            }
-            self.writer_iter = None;
-        }
-
-        let sub_msg = self.submsgs.next()?;
-        self.msg_recv.submessage_count += 1;
-
-        if let Some(ret) = self.msg_recv.handle_submessage(sub_msg, &mut self.writer_iter, self.ring, self.topic_cache) {
-            Some(ret)
-        } else {
-            self.next()
-        }
-    }
-}
-

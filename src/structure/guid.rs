@@ -368,10 +368,9 @@ impl EntityId {
     (u1 << 24) | (u2 << 16) | (u3 << 8) | u4
   }
 
-
   /// Use this only with usize generated with EntityID::as_usize function.!!!
   fn from_usize(number: usize) -> Self {
-      Self::from_u32(number as u32)
+    Self::from_u32(number as u32)
   }
 
   pub(crate) fn from_u32(number: u32) -> Self {

@@ -4,8 +4,8 @@ pub use writer::{Writer, WriterIngredients};
 pub(crate) mod reader;
 pub use reader::{Reader, ReaderIngredients};
 mod reader_proxy;
+pub(crate) use reader_proxy::RtpsReaderProxy;
 mod dp_event_loop;
 
 pub use message_receiver::{MessageReceiver, PassedSubmessage};
-pub use dp_event_loop::Domain;
-pub(crate) use dp_event_loop::DataStatus;
+pub use dp_event_loop::{Domain, DomainRef, DomainStatusEvent, DataStatus};

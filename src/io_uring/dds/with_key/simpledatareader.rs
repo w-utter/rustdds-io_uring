@@ -1,9 +1,4 @@
-use std::{
-  cmp::max,
-  collections::BTreeMap,
-  marker::PhantomData,
-  sync::Mutex,
-};
+use std::{cmp::max, collections::BTreeMap, marker::PhantomData, sync::Mutex};
 
 use serde::de::DeserializeOwned;
 #[allow(unused_imports)]
@@ -42,7 +37,6 @@ pub struct SimpleDataReader<D: Keyed, DA: DeserializerAdapter<D> = CDRDeserializ
 
   // SimpleDataReader stores a pointer to a mutex on the topic cache
   //topic_cache: Arc<Mutex<TopicCache>>,
-
   read_state: Mutex<ReadState<<D as Keyed>::K>>,
 
   deserializer_type: PhantomData<DA>, // This is to provide use for DA
@@ -54,7 +48,7 @@ where
   DA: DeserializerAdapter<D>,
 {
   fn drop(&mut self) {
-      /* TODO
+    /* TODO
     // Tell dp_event_loop
     self.my_subscriber.remove_reader(self.my_guid);
 
@@ -244,7 +238,10 @@ where
 
   /// Note: Always remember to call .drain_read_notifications() just before
   /// calling this one. Otherwise, new notifications may not appear.
-  pub fn try_take_one(&self, topic_cache: &TopicCache) -> ReadResult<Option<DeserializedCacheChange<D>>>
+  pub fn try_take_one(
+    &self,
+    topic_cache: &TopicCache,
+  ) -> ReadResult<Option<DeserializedCacheChange<D>>>
   where
     DA: DeserializerAdapter<D> + DefaultDecoder<D>,
   {
@@ -254,7 +251,11 @@ where
   /// Note: Always remember to call .drain_read_notifications() just before
   /// calling this one. Otherwise, new notifications may not appear.
   #[allow(clippy::needless_pass_by_value)]
-  pub fn try_take_one_with<S>(&self, decoder: S, topic_cache: &TopicCache) -> ReadResult<Option<DeserializedCacheChange<D>>>
+  pub fn try_take_one_with<S>(
+    &self,
+    decoder: S,
+    topic_cache: &TopicCache,
+  ) -> ReadResult<Option<DeserializedCacheChange<D>>>
   where
     S: Decode<DA::Decoded, DA::DecodedKey> + Clone,
   {

@@ -14,9 +14,7 @@ pub use writer::{Writer, WriterIngredients};
 pub(crate) mod message;
 pub use message::{Message, MessageBuilder};
 
-
 pub(crate) mod submessage;
 pub use submessage::{Submessage, SubmessageBody};
-
 
 pub use message_receiver::MessageReceiver;

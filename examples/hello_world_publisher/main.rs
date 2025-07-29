@@ -24,6 +24,12 @@ impl Keyed for HelloWorldData {
 }
 
 fn main() {
+  let (stop_sender, stop_receiver) = smol::channel::bounded(1);
+
+  ctrlc::set_handler(move || stop_sender.send_blocking(()).unwrap_or(()))
+    .expect("error setting ctrl-c handler");
+  println!("Press Ctrl-C to quit.");
+
   let domain_participant = DomainParticipantBuilder::new(0)
     .build()
     .unwrap_or_else(|e| panic!("DomainParticipant construction failed: {e:?}"));
@@ -63,11 +69,20 @@ fn main() {
     let mut match_timeout_timer = futures::FutureExt::fuse(Timer::after(Duration::from_secs(10)));
 
     println!("Ready to say hello");
+
+    /*
+    println!("Sending hello");
+    writer
+      .async_write(hello_message.clone(), None)
+      .unwrap_or_else(|e| error!("DataWriter async_write failed: {e:?}"))
+      .await;
+      */
     loop {
       futures::select! {
+        _ = stop_receiver.recv().fuse() => break,
         _ = match_timeout_timer => {
           println!("Timeout waiting for subscriber at appear.");
-          break
+          //break
         }
         _ = write_trigger_receiver.recv().fuse() => {
           println!("Sending hello");

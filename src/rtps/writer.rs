@@ -472,6 +472,7 @@ impl Writer {
         TimedEvent::SendRepairData {
           to_reader: reader_guid,
         } => {
+          println!("timed repair event");
           self.handle_repair_data_send(reader_guid);
           if let Some(rp) = self.lookup_reader_proxy_mut(reader_guid) {
             if rp.repair_mode {
@@ -746,6 +747,13 @@ impl Writer {
         self.security_plugins.as_ref(),
       );
 
+      if self.my_guid.entity_id.entity_kind.is_user_defined() {
+        println!(
+          "\nsending data msg with {:?} to {reader_entity_id:?}\n",
+          self.my_guid
+        );
+      }
+
       // Add HEARTBEAT if needed
       if send_also_heartbeat && !self.like_stateless {
         let final_flag = false; // false = request that readers acknowledge with ACKNACK.
@@ -956,6 +964,9 @@ impl Writer {
           }
         }
       } else {
+        if self.my_guid.entity_id.entity_kind.is_user_defined() {
+          println!("sending hb to readers: {hb_message:?}");
+        }
         // Normal case
         self.send_message_to_readers(
           DeliveryMode::Multicast,
@@ -990,6 +1001,7 @@ impl Writer {
       AckSubmessage::AckNack(ref an) => {
         // Update the ReaderProxy
         let last_seq = self.history_buffer.last_change_sequence_number(); // to avoid borrow problems
+        println!("received acknack on {:?}", self.my_guid.entity_id);
 
         // sanity check requested sequence numbers
         if let Some(0) = an.reader_sn_state.iter().next().map(i64::from) {
@@ -1138,6 +1150,11 @@ impl Writer {
       );
       return;
     }
+
+    println!(
+      "\n!!! sending repair data from id {:?}\n",
+      self.my_guid.entity_id
+    );
     // Note: here we remove the reader from our reader map temporarily.
     // Then we can mutate both the reader and other fields in self.
     // Doing a .get_mut() on the reader map would make self immutable.
@@ -1491,6 +1508,10 @@ impl Writer {
     // TODO: In addition to Locators found in Readers, we should observe
     // the Locators given in MEssageReceiverState, i.e. if there was an
     // applicable InfoReply submessage, and we are sending a reply.
+
+    if self.my_guid.entity_id.entity_kind.is_user_defined() {
+      println!("sending data on {:?}: {message:?}", self.my_guid.entity_id);
+    }
 
     let readers = readers.collect::<Vec<_>>(); // clone iterator
 

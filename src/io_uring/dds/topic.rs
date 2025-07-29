@@ -127,7 +127,7 @@ impl Debug for Topic {
 impl TopicDescription for Topic {
   /// Gets [DomainParticipant](struct.DomainParticipant.html) if it is still
   /// alive.
-    /*
+  /*
   fn participant(&self) -> Option<DomainParticipant> {
     self.participant()
   }
@@ -207,8 +207,8 @@ impl InnerTopic {
 
 impl PartialEq for InnerTopic {
   fn eq(&self, other: &Self) -> bool {
-    //self.participant() == other.participant() && 
-        self.get_type() == other.get_type()
+    //self.participant() == other.participant() &&
+    self.get_type() == other.get_type()
       && self.name() == other.name()
       && self.qos() == other.qos()
       && self.topic_kind == other.topic_kind
@@ -228,7 +228,7 @@ impl Debug for InnerTopic {
 impl TopicDescription for InnerTopic {
   /// Gets [DomainParticipant](struct.DomainParticipant.html) if it is still
   /// alive.
-    /*
+  /*
   fn participant(&self) -> Option<DomainParticipant> {
     self.participant()
   }

@@ -395,10 +395,7 @@ where
   // before this call obtained by select_*_for_access functions. This function
   // will blindly assume that the given keys and timestamps are present in the
   // cache. Function will panic if somthign is not found.
-  pub(crate) fn read_by_keys(
-    &mut self,
-    keys: &[(Timestamp, D::K)],
-  ) -> Vec<DataSample<&D>> {
+  pub(crate) fn read_by_keys(&mut self, keys: &[(Timestamp, D::K)]) -> Vec<DataSample<&D>> {
     let len = keys.len();
     let mut result = Vec::with_capacity(len);
 
@@ -465,10 +462,7 @@ where
   // before this call obtained by select_*_for_access functions. This function
   // will blindly assume that the given keys and timestamps are present in the
   // cache. Function will panic if somthign is not found.
-  pub(crate) fn take_by_keys(
-    &mut self,
-    keys: &[(Timestamp, D::K)],
-  ) -> Vec<DataSample<D>> {
+  pub(crate) fn take_by_keys(&mut self, keys: &[(Timestamp, D::K)]) -> Vec<DataSample<D>> {
     let len = keys.len();
     let mut result = Vec::with_capacity(len);
 
@@ -514,10 +508,7 @@ where
   // before this call obtained by select_*_for_access functions. This function
   // will blindly assume that the given keys and timestamps are present in the
   // cache. Function will panic if somthign is not found.
-  pub(crate) fn read_bare_by_keys(
-    &mut self,
-    keys: &[(Timestamp, D::K)],
-  ) -> Vec<Sample<&D, D::K>> {
+  pub(crate) fn read_bare_by_keys(&mut self, keys: &[(Timestamp, D::K)]) -> Vec<Sample<&D, D::K>> {
     let len = keys.len();
     let mut result = Vec::with_capacity(len);
 
@@ -557,10 +548,7 @@ where
   // before this call obtained by select_*_for_access functions. This function
   // will blindly assume that the given keys and timestamps are present in the
   // cache. Function will panic if somthign is not found.
-  pub(crate) fn take_bare_by_keys(
-    &mut self,
-    keys: &[(Timestamp, D::K)],
-  ) -> Vec<Sample<D, D::K>> {
+  pub(crate) fn take_bare_by_keys(&mut self, keys: &[(Timestamp, D::K)]) -> Vec<Sample<D, D::K>> {
     let len = keys.len();
     let mut result = Vec::with_capacity(len);
 

@@ -1,8 +1,8 @@
+mod discovery;
 mod discovery_db;
 pub(crate) mod traffic;
-mod discovery;
 
 pub use traffic::UdpListeners;
 pub use discovery::{Discovery2, Discovered};
-pub use discovery_db::DiscoveryDB; 
+pub use discovery_db::DiscoveryDB;
 pub(crate) use discovery::{Cache, Caches, DiscoveredKind, BuiltinParticipantLost, ParticipantCleanup};

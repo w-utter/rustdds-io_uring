@@ -5,13 +5,14 @@ use crate::{
     adapters::no_key::SerializerAdapter,
     qos::{HasQoSPolicy, QosPolicies},
     result::{unwrap_no_key_write_error, WriteResult},
-    topic::Topic,
   },
   discovery::sedp_messages::SubscriptionBuiltinTopicData,
   serialization::CDRSerializerAdapter,
   structure::{entity::RTPSEntity, rpc::SampleIdentity, time::Timestamp},
   GUID,
 };
+
+use crate::io_uring::dds::Topic;
 use crate::no_key::wrappers::{NoKeyWrapper, SAWrapper};
 use crate::io_uring::dds::with_key::datawriter as datawriter_with_key;
 use crate::io_uring::dds::with_key::datawriter::DataSample;
@@ -82,7 +83,11 @@ where
   /// let some_data = SomeType {};
   /// data_writer.write(some_data, None).unwrap();
   /// ```
-  pub fn write(&self, data: D, source_timestamp: Option<Timestamp>) -> WriteResult<(DataSample<'_, NoKeyWrapper<D>, SAWrapper<SA>>, Option<DiscoveryCommand>), D> {
+  pub fn write(
+    &self,
+    data: D,
+    source_timestamp: Option<Timestamp>,
+  ) -> WriteResult<(DataSample<'_, NoKeyWrapper<D>, SAWrapper<SA>>), D> {
     self
       .keyed_datawriter
       .write(NoKeyWrapper::<D> { d: data }, source_timestamp)
@@ -93,7 +98,13 @@ where
     &self,
     data: D,
     write_options: WriteOptions,
-  ) -> WriteResult<(SampleIdentity, DataSample<'_, NoKeyWrapper<D>, SAWrapper<SA>>, Option<DiscoveryCommand>), D> {
+  ) -> WriteResult<
+    (
+      SampleIdentity,
+      DataSample<'_, NoKeyWrapper<D>, SAWrapper<SA>>,
+    ),
+    D,
+  > {
     self
       .keyed_datawriter
       .write_with_options(NoKeyWrapper::<D> { d: data }, write_options)

@@ -8,12 +8,12 @@ use chrono::Utc;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 
+use crate::io_uring::dds::topic::{Topic, TopicDescription};
 use crate::{
   dds::{
     participant::DomainParticipant,
     qos::HasQoSPolicy,
     statusevents::{DomainParticipantStatusEvent, LostReason},
-    topic::{Topic, TopicDescription},
   },
   rtps::{
     reader::ReaderIngredients, rtps_reader_proxy::RtpsReaderProxy,
@@ -115,9 +115,7 @@ pub(crate) fn discovery_db_write(
 }
 
 impl DiscoveryDB {
-  pub fn new(
-    my_guid: GUID,
-  ) -> Self {
+  pub fn new(my_guid: GUID) -> Self {
     Self {
       my_guid,
       participant_proxies: BTreeMap::new(),
@@ -410,7 +408,10 @@ impl DiscoveryDB {
   // them from the remote participant.
   //
   // The topic is updated to the topics table.
-  pub fn update_subscription(&mut self, data: &DiscoveredReaderData) -> (DiscoveredReaderData, Option<DomainParticipantStatusEvent>) {
+  pub fn update_subscription(
+    &mut self,
+    data: &DiscoveredReaderData,
+  ) -> (DiscoveredReaderData, Option<DomainParticipantStatusEvent>) {
     let guid = data.reader_proxy.remote_reader_guid;
 
     self.external_topic_readers.insert(guid, data.clone());
@@ -453,18 +454,24 @@ impl DiscoveryDB {
     // from that record and modify by QoS given in the DRD.
 
     // Return DiscoveredReaderData with possibly updated locators.
-    (DiscoveredReaderData {
-      reader_proxy: ReaderProxy::from(RtpsReaderProxy::from_discovered_reader_data(
-        data,
-        &default_locator_lists.0,
-        &default_locator_lists.1,
-      )),
-      ..data.clone()
-    }, status_event)
+    (
+      DiscoveredReaderData {
+        reader_proxy: ReaderProxy::from(RtpsReaderProxy::from_discovered_reader_data(
+          data,
+          &default_locator_lists.0,
+          &default_locator_lists.1,
+        )),
+        ..data.clone()
+      },
+      status_event,
+    )
   }
 
   // TODO: This is silly. Returns one of the parameters cloned, or None
-  pub fn update_publication(&mut self, data: &DiscoveredWriterData) -> (DiscoveredWriterData, Option<DomainParticipantStatusEvent>) {
+  pub fn update_publication(
+    &mut self,
+    data: &DiscoveredWriterData,
+  ) -> (DiscoveredWriterData, Option<DomainParticipantStatusEvent>) {
     let guid = data.writer_proxy.remote_writer_guid;
 
     self
@@ -505,14 +512,17 @@ impl DiscoveryDB {
       DiscoveredVia::Publication,
     );
 
-    (DiscoveredWriterData {
-      writer_proxy: WriterProxy::from(RtpsWriterProxy::from_discovered_writer_data(
-        data,
-        &default_locator_lists.0,
-        &default_locator_lists.1,
-      )),
-      ..data.clone()
-    }, status_event)
+    (
+      DiscoveredWriterData {
+        writer_proxy: WriterProxy::from(RtpsWriterProxy::from_discovered_writer_data(
+          data,
+          &default_locator_lists.0,
+          &default_locator_lists.1,
+        )),
+        ..data.clone()
+      },
+      status_event,
+    )
   }
 
   // This is for local participant updating the topic table
@@ -605,44 +615,17 @@ impl DiscoveryDB {
       return Some(DomainParticipantStatusEvent::TopicDetected {
         name: dtd.topic_data.name.clone(),
         type_name: dtd.topic_data.type_name.clone(),
-      })
+      });
     };
     inconsistency_event_to_send
   }
 
   // local topic readers
-  pub fn update_local_topic_reader(
-    &mut self,
-    domain_participant: &DomainParticipant,
-    topic: &Topic,
-    reader: &ReaderIngredients,
-    sec_info_opt: Option<EndpointSecurityInfo>,
-  ) {
-    let reader_guid = reader.guid;
-
-    let reader_proxy = RtpsReaderProxy::from_reader(reader, domain_participant);
-
-    let subscription_data = SubscriptionBuiltinTopicData::new(
-      reader_guid,
-      Some(domain_participant.guid()),
-      topic.name(),
-      topic.get_type().name().to_string(),
-      &reader.qos_policy,
-      sec_info_opt,
+  pub fn update_local_topic_reader(&mut self, discovered_reader_data: DiscoveredReaderData) {
+    self.local_topic_readers.insert(
+      discovered_reader_data.reader_proxy.remote_reader_guid,
+      discovered_reader_data,
     );
-
-    // TODO: possibly change content filter to dynamic value
-    let content_filter = None;
-
-    let discovered_reader_data = DiscoveredReaderData {
-      reader_proxy: ReaderProxy::from(reader_proxy),
-      subscription_topic_data: subscription_data,
-      content_filter,
-    };
-
-    self
-      .local_topic_readers
-      .insert(reader_guid, discovered_reader_data);
   }
 
   pub fn remove_local_topic_reader(&mut self, guid: GUID) {
@@ -787,9 +770,7 @@ mod tests {
 
   #[test]
   fn discdb_participant_operations() {
-    let mut discoverydb = DiscoveryDB::new(
-      GUID::new_participant_guid(),
-    );
+    let mut discoverydb = DiscoveryDB::new(GUID::new_participant_guid());
     let mut data = spdp_participant_data().unwrap();
     data.lease_duration = Some(Duration::from(StdDuration::from_secs(1)));
 
@@ -808,9 +789,7 @@ mod tests {
 
   #[test]
   fn discdb_writer_proxies() {
-    let _discoverydb = DiscoveryDB::new(
-      GUID::new_participant_guid(),
-    );
+    let _discoverydb = DiscoveryDB::new(GUID::new_participant_guid());
     let topic_name = String::from("some_topic");
     let type_name = String::from("RandomData");
     let _dreader = DiscoveredReaderData::default(topic_name, type_name);
@@ -820,9 +799,7 @@ mod tests {
 
   #[test]
   fn discdb_subscription_operations() {
-    let mut discovery_db = DiscoveryDB::new(
-      GUID::new_participant_guid(),
-    );
+    let mut discovery_db = DiscoveryDB::new(GUID::new_participant_guid());
 
     let domain_participant = DomainParticipant::new(0).expect("Failed to create publisher");
     let topic = domain_participant
@@ -912,9 +889,7 @@ mod tests {
         TopicKind::WithKey,
       )
       .unwrap();
-    let mut discoverydb = DiscoveryDB::new(
-      GUID::new_participant_guid(),
-    );
+    let mut discoverydb = DiscoveryDB::new(GUID::new_participant_guid());
 
     // Create reader ingredients
     let (notification_sender1, _notification_receiver1) = mio_extras::channel::sync_channel(100);
