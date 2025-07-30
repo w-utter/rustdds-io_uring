@@ -30,21 +30,12 @@ impl<T> Timer<T, Uninit> {
     Self { state, t }
   }
 
-  pub(crate) fn new_oneshot(t: T, duration: Duration) -> Self {
-    Self::new(t, TimerState::Oneshot(duration))
-  }
-
   pub(crate) fn new_periodic(t: T, duration: Duration) -> Self {
     let state = TimerState::Periodic {
       current: duration,
       interval: duration,
     };
     Self::new(t, state)
-  }
-
-  pub(crate) fn with_flags(mut self, flags: SetTimeFlags) -> Self {
-    self.state.flags = Some(flags);
-    self
   }
 
   pub(crate) fn register(
@@ -100,10 +91,6 @@ impl<T> Timer<T, Init> {
     self.t
   }
 
-  pub(crate) fn inner_mut(&mut self) -> &mut T {
-    &mut self.t
-  }
-
   pub(crate) fn try_update_duration(&mut self, duration: Duration, flags: Option<SetTimeFlags>) {
     match self.state.prev_state {
       TimerState::Periodic { interval, .. } if duration != interval => {
@@ -132,27 +119,6 @@ impl<T> Timer<T, Init> {
     timer.state.flags = flags;
 
     timer.register(ring, domain_id, kind)
-  }
-
-  pub(crate) fn new_immediate_periodic(
-    t: T,
-    duration: Duration,
-    flags: Option<SetTimeFlags>,
-    ring: &mut io_uring::IoUring,
-    domain_id: u16,
-    kind: user_data::Timer,
-  ) -> std::io::Result<Self> {
-    Self::new_immediate(
-      t,
-      TimerState::Periodic {
-        current: duration,
-        interval: duration,
-      },
-      flags,
-      ring,
-      domain_id,
-      kind,
-    )
   }
 
   pub(crate) fn new_immediate_oneshot(

@@ -143,17 +143,6 @@ impl From<RtpsReaderProxy> for ReaderProxy {
   }
 }
 
-impl From<crate::io_uring::rtps::RtpsReaderProxy> for ReaderProxy {
-  fn from(rtps_reader_proxy: crate::io_uring::rtps::RtpsReaderProxy) -> Self {
-    Self {
-      remote_reader_guid: rtps_reader_proxy.remote_reader_guid,
-      expects_inline_qos: rtps_reader_proxy.expects_inline_qos(),
-      unicast_locator_list: rtps_reader_proxy.unicast_locator_list,
-      multicast_locator_list: rtps_reader_proxy.multicast_locator_list,
-    }
-  }
-}
-
 // =======================================================================
 // =======================================================================
 // =======================================================================
@@ -798,8 +787,6 @@ impl DiscoveredWriterData {
   pub fn new_io_uring<D: Keyed, SA: SerializerAdapter<D>>(
     writer: &crate::io_uring::dds::with_key::DataWriter<D, SA>,
     topic: &crate::io_uring::dds::Topic,
-    domain_id: u16,
-    participant_id: u16,
     domain_guid: GUID,
     security_info: Option<EndpointSecurityInfo>,
     unicast_locators: Vec<Locator>,

@@ -85,65 +85,8 @@ use crate::{
 #[cfg(not(feature = "security"))]
 use crate::no_security::*;
 
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub enum DiscoveryCommand {
-  StopDiscovery,
-  AddLocalWriter {
-    guid: GUID,
-  },
-  AddLocalReader {
-    guid: GUID,
-  },
-  AddTopic {
-    topic_name: String,
-  },
-  RemoveLocalWriter {
-    guid: GUID,
-  },
-  RemoveLocalReader {
-    guid: GUID,
-  },
-  ManualAssertLiveliness,
-  AssertTopicLiveliness {
-    writer_guid: GUID,
-    manual_assertion: bool,
-  },
-
-  #[cfg(feature = "security")]
-  StartKeyExchangeWithRemoteParticipant {
-    participant_guid_prefix: GuidPrefix,
-  },
-
-  #[cfg(feature = "security")]
-  StartKeyExchangeWithRemoteEndpoint {
-    local_endpoint_guid: GUID,
-    remote_endpoint_guid: GUID,
-  },
-}
-
-pub struct LivelinessState {
-  last_auto_update: Timestamp,
-  pub(crate) manual_participant_liveness_refresh_requested: bool,
-}
-
-impl LivelinessState {
-  pub fn new() -> Self {
-    Self {
-      last_auto_update: Timestamp::now(),
-      manual_participant_liveness_refresh_requested: false,
-    }
-  }
-}
-
-// Enum indicating if secure discovery allows normal discovery to process
-// something
-#[derive(PartialEq)]
-pub(crate) enum NormalDiscoveryPermission {
-  Allow,
-  #[cfg(feature = "security")] // Deny variant is never constructed if security feature is not on
-  Deny,
-}
-
+use crate::discovery::discovery::LivelinessState;
+//use crate::discovery::discovery::NormalDiscoveryPermission;
 use crate::io_uring::timer::{Timer, timer_state};
 
 struct Timers<T> {
@@ -835,7 +778,7 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
     // remove changes until first sn
     proxy.irrelevant_changes_up_to(heartbeat.first_sn);
 
-    let marker_moved = self
+    self
       .topic
       .mark_reliably_received_before(writer_guid, proxy.all_ackable_before());
 
@@ -924,7 +867,7 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
       let acknack_flags = BitFlags::<ACKNACK_Flags>::from_flag(ACKNACK_Flags::Endianness)
         | BitFlags::<ACKNACK_Flags>::from_flag(ACKNACK_Flags::Final);
 
-      let nackfrag_flags = BitFlags::<NACKFRAG_Flags>::from_flag(NACKFRAG_Flags::Endianness);
+      let _nackfrag_flags = BitFlags::<NACKFRAG_Flags>::from_flag(NACKFRAG_Flags::Endianness);
 
       // send NackFrags, if any
       //let mut nackfrags = Vec::new();
@@ -999,13 +942,6 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
     }
 
     false
-  }
-
-  fn is_frag_partially_received(&self, writer_guid: GUID, seq: SequenceNumber) -> bool {
-    self
-      .fragment_assemblers
-      .get(&writer_guid)
-      .is_some_and(|fa| fa.is_partially_received(seq))
   }
 
   fn create_acknack(
@@ -1431,7 +1367,7 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
     self.history_buffer.remove_changes_before(first_keeper);
   }
 
-  fn handle_heartbeat_tick(
+  pub(crate) fn handle_heartbeat_tick(
     &mut self,
     manual_assertion: bool,
     udp_sender: &UDPSender,
@@ -1463,8 +1399,8 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
       .ts_msg(endianness, Some(Timestamp::now()))
       .heartbeat_msg(
         self.writer_guid.entity_id, // from Writer
-        self.history_buffer.first_change_sequence_number(),
-        self.history_buffer.last_change_sequence_number(),
+        first_change,
+        last_change,
         self.next_heartbeat_count(),
         endianness,
         EntityId::UNKNOWN, // to Reader
@@ -1472,16 +1408,6 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
         liveliness_flag,
       )
       .add_header_and_build(self.writer_guid.prefix);
-
-    /*
-    debug!(
-      "Writer {:?} topic={:} HEARTBEAT {:?} to {:?}",
-      self.writer_guid.entity_id,
-      self.topic_name(),
-      first_change,
-      last_change,
-    );
-    */
 
     // In the volatile key exchange topic we cannot send to multiple readers by any
     // means, so we handle that separately.
@@ -1514,7 +1440,7 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
     }
   }
 
-  fn handle_reader_timed_event(&mut self, ev: &user_data::ReadTimerVariant) {
+  fn handle_reader_timed_event(&mut self, _ev: &user_data::ReadTimerVariant) {
     todo!()
   }
 }
@@ -2141,7 +2067,6 @@ enum RediscoveredState {
   ),
   Reader(std::vec::IntoIter<DataSample<DiscoveredReaderData>>),
   Writer(std::vec::IntoIter<DataSample<DiscoveredWriterData>>),
-  Done,
 }
 
 #[derive(Debug)]
@@ -2201,7 +2126,7 @@ impl<'a, 'b, 'c> Discovered<'a, 'b, 'c> {
 }
 
 #[derive(Debug)]
-pub enum DiscoveredKind {
+pub(crate) enum DiscoveredKind {
   Participant(ParticipantDiscoveryIter),
   Topic(TopicDiscoveryIter),
   Reader(DiscoveredIter<DiscoveredReaderData>),
@@ -2235,29 +2160,9 @@ struct ParticipantDiscoveryIterInner<'a, 'b, 'c> {
 }
 
 impl<'a, 'b, 'c, 'd> ParticipantDiscoveryIterInner<'a, 'b, 'c> {
-  fn new(
-    participant_guid_prefix: &'c GuidPrefix,
-    discovery_db: &'a mut DiscoveryDB,
-    participant_data: &'c mut vec::IntoIter<DataSample<SpdpDiscoveredParticipantData>>,
-    topic_data: &'b mut DataSampleCache<DiscoveredTopicData>,
-    reader_data: &'b mut DataSampleCache<DiscoveredReaderData>,
-    writer_data: &'b mut DataSampleCache<DiscoveredWriterData>,
-    current: &'c mut Option<(RediscoveredState, GuidPrefix)>,
-  ) -> Self {
-    Self {
-      participant_guid_prefix,
-      discovery_db,
-      participant_data,
-      topic_data,
-      reader_data,
-      writer_data,
-      current,
-    }
-  }
-
   fn advance_state<D: Keyed>(
     cache: &mut DataSampleCache<D>,
-    mut f: impl FnMut(&DataSample<D>) -> bool,
+    f: impl FnMut(&DataSample<D>) -> bool,
   ) -> std::vec::IntoIter<DataSample<D>> {
     let read_condition = ReadCondition::any();
     let keys = cache.select_keys_for_access(read_condition);
@@ -2297,7 +2202,7 @@ impl Iterator for ParticipantDiscoveryIterInner<'_, '_, '_> {
     // this is the only way to make the compiler happy.
     // something about the invariance of the lifetimes.
     match &mut self.current {
-      None | Some((RediscoveredState::Done, _)) => (),
+      None => (),
       Some((RediscoveredState::Topic(topics, state), guid)) => {
         if let Some(ret) = TopicDiscoveryIterInner::new(self.discovery_db, topics, state).next() {
           return Some(ret);
@@ -2335,7 +2240,7 @@ impl Iterator for ParticipantDiscoveryIterInner<'_, '_, '_> {
         }
         drop(writers);
       }
-      Some((RediscoveredState::Writer(writers), guid)) => {
+      Some((RediscoveredState::Writer(writers), _guid)) => {
         if let Some(ret) = DiscoveredData::new(self.discovery_db, writers).next() {
           return Some(ret);
         }
@@ -2645,7 +2550,7 @@ impl Iterator for DiscoveredData<'_, '_, DiscoveredTopicData> {
             .update_topic_data(&topic_data, writer, DiscoveredVia::Topic);
         Some((topic_data, writer.prefix, status_event))
       }
-      Sample::Dispose(key) => {
+      Sample::Dispose(_key) => {
         warn!("not implemented");
         None
       }
@@ -2681,7 +2586,7 @@ impl Timers<timer_state::Uninit> {
   }
 
   fn register(
-    mut self,
+    self,
     ring: &mut io_uring::IoUring,
     domain_id: u16,
   ) -> std::io::Result<Timers<timer_state::Init>> {
@@ -2796,7 +2701,7 @@ impl Discovery2<timer_state::Uninit> {
 }
 
 impl Discovery2<timer_state::Init> {
-  pub fn handle_writer_msg<'a, 'b>(
+  pub(crate) fn handle_writer_msg<'a, 'b>(
     &'a mut self,
     submsg: WriterSubmessage,
     mr_state: &MessageReceiverState,
@@ -2991,7 +2896,7 @@ impl Discovery2<timer_state::Init> {
 
         use crate::io_uring::discovery::discovery::Reliability;
 
-        let is_reliable = matches!(
+        let _is_reliable = matches!(
           topic_cache.topic_qos.reliability(),
           Some(Reliability::Reliable { .. })
         );
@@ -3212,7 +3117,8 @@ impl Discovery2<timer_state::Init> {
       self
         .caches
         .participant_messages
-        .write::<CDRSerializerAdapter<ParticipantMessageData>>(msg, udp_sender, ring);
+        .write::<CDRSerializerAdapter<ParticipantMessageData>>(msg, udp_sender, ring)
+        .unwrap();
     }
   }
 
@@ -3250,7 +3156,8 @@ impl Discovery2<timer_state::Init> {
     self
       .caches
       .publications
-      .write::<PlCdrSerializerAdapter<DiscoveredWriterData>>(writer.clone(), udp_sender, ring);
+      .write::<PlCdrSerializerAdapter<DiscoveredWriterData>>(writer.clone(), udp_sender, ring)
+      .unwrap();
   }
 
   pub fn publish_reader(
@@ -3279,7 +3186,8 @@ impl Discovery2<timer_state::Init> {
     self
       .caches
       .subscriptions
-      .write::<PlCdrSerializerAdapter<DiscoveredReaderData>>(reader.clone(), udp_sender, ring);
+      .write::<PlCdrSerializerAdapter<DiscoveredReaderData>>(reader.clone(), udp_sender, ring)
+      .unwrap();
   }
 
   pub fn initialize(
@@ -3389,7 +3297,8 @@ impl Discovery2<timer_state::Init> {
         &Endpoint_GUID(guid),
         udp_sender,
         ring,
-      );
+      )
+      .unwrap();
   }
 
   pub fn remove_reader(
@@ -3409,7 +3318,8 @@ impl Discovery2<timer_state::Init> {
         &Endpoint_GUID(guid),
         udp_sender,
         ring,
-      );
+      )
+      .unwrap();
   }
 
   pub fn publish_topic(
@@ -3433,7 +3343,8 @@ impl Discovery2<timer_state::Init> {
     self
       .caches
       .topics
-      .write::<PlCdrSerializerAdapter<DiscoveredTopicData>>(topic_data.clone(), udp_sender, ring);
+      .write::<PlCdrSerializerAdapter<DiscoveredTopicData>>(topic_data.clone(), udp_sender, ring)
+      .unwrap();
   }
 }
 

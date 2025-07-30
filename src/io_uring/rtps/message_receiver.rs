@@ -1,11 +1,8 @@
 use std::collections::{btree_map::Entry, BTreeMap};
 
-use enumflags2::BitFlags;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use bytes::Bytes;
-
-use crate::structure::dds_cache::TopicCache;
 
 use crate::{
   messages::{protocol_version::ProtocolVersion, submessages::submessages::*, vendor_id::VendorId},
@@ -41,11 +38,6 @@ use crate::dds::ddsdata::DDSData;
 use crate::structure::sequence_number::SequenceNumber;
 
 const RTPS_MESSAGE_HEADER_SIZE: usize = 20;
-
-pub enum SubmessageSideEffect {
-  AckNack(GuidPrefix, AckSubmessage),
-  SpdpLiveness(GuidPrefix),
-}
 
 #[derive(Debug)]
 pub enum PassedSubmessage {
@@ -122,10 +114,9 @@ impl<'a> Iterator for SubmessageIter2<'a> {
             }
           }
         }
-      }
-      //TODO: add security support later
-      //this wold still allow for only reader/writer submsgs to be passed along
-      _ => None,
+      } //TODO: add security support later
+        //this wold still allow for only reader/writer submsgs to be passed along
+        //_ => None,
     }
   }
 }
@@ -373,132 +364,6 @@ impl MessageReceiver {
     SubmessageIter2::new(self, decoded_message.submessages.into_iter())
   }
 
-  fn handle_writer_submessage(
-    &mut self,
-    target_reader_entity_id: EntityId,
-    submessage: WriterSubmessage,
-    udp_sender: &UDPSender,
-    ring: &mut io_uring::IoUring,
-    topic_cache: &mut TopicCache,
-  ) -> Option<SubmessageSideEffect> {
-    if self.dest_guid_prefix != self.own_guid_prefix && self.dest_guid_prefix != GuidPrefix::UNKNOWN
-    {
-      //println!("\nmessage not meant for this participant\n");
-      debug!(
-        "Message is not for this participant. Dropping. dest_guid_prefix={:?} participant \
-         guid={:?}",
-        self.dest_guid_prefix, self.own_guid_prefix
-      );
-      return None;
-    }
-
-    #[cfg(feature = "security")]
-    if self.must_be_rtps_protection_special_case {
-      match target_reader_entity_id {
-        // These submessages are the special case
-        EntityId::SPDP_BUILTIN_PARTICIPANT_READER
-        | EntityId::P2P_BUILTIN_PARTICIPANT_STATELESS_READER
-        | EntityId::P2P_BUILTIN_PARTICIPANT_VOLATILE_SECURE_READER => (),
-        // Otherwise we have to reject
-        other => {
-          error!(
-            "Received an unprotected message containing a writer submessage for the reader \
-             {other:?} in an rtps-protected domain."
-          );
-          return None;
-        }
-      }
-    }
-
-    let mr_state = self.clone_partial_message_receiver_state();
-    let writer_entity_id = submessage.sender_entity_id();
-    let source_guid_prefix = mr_state.source_guid_prefix;
-    let source_guid = &GUID {
-      prefix: source_guid_prefix,
-      entity_id: writer_entity_id,
-    };
-
-    let security_plugins = self.security_plugins.clone();
-
-    let target_reader = if let Some(target_reader) = self.reader_mut(target_reader_entity_id) {
-      target_reader
-    } else {
-      error!("No reader matching the CryptoHandle found");
-      return None;
-    };
-
-    match submessage {
-      WriterSubmessage::Data(data, data_flags) => {
-        Self::decode_and_handle_data(
-          security_plugins.as_ref(),
-          source_guid,
-          data,
-          data_flags,
-          target_reader,
-          &mr_state,
-          topic_cache,
-        );
-
-        // Notify discovery that the remote PArticipant seems to be alive
-        if writer_entity_id == EntityId::SPDP_BUILTIN_PARTICIPANT_WRITER
-          && target_reader_entity_id == EntityId::SPDP_BUILTIN_PARTICIPANT_READER
-        {
-          return Some(SubmessageSideEffect::SpdpLiveness(source_guid_prefix));
-        }
-        return None;
-      }
-
-      WriterSubmessage::Heartbeat(heartbeat, flags) => {
-        target_reader.handle_heartbeat_msg(
-          &heartbeat,
-          flags.contains(HEARTBEAT_Flags::Final),
-          &mr_state,
-          udp_sender,
-          ring,
-          topic_cache,
-        );
-        return None;
-      }
-
-      WriterSubmessage::Gap(gap, _flags) => {
-        target_reader.handle_gap_msg(&gap, &mr_state, topic_cache);
-        return None;
-      }
-
-      WriterSubmessage::DataFrag(datafrag, flags) => {
-        Self::decode_and_handle_datafrag(
-          security_plugins.as_ref(),
-          source_guid,
-          datafrag.clone(),
-          flags,
-          target_reader,
-          &mr_state,
-          topic_cache,
-        );
-        return None;
-      }
-
-      WriterSubmessage::HeartbeatFrag(heartbeatfrag, _flags) => {
-        target_reader.handle_heartbeatfrag_msg(&heartbeatfrag, &mr_state);
-        return None;
-      }
-    }
-  }
-
-  // see security version of the same function below
-  #[cfg(not(feature = "security"))]
-  fn decode_and_handle_data(
-    _security_plugins: Option<&SecurityPluginsHandle>,
-    _source_guid: &GUID,
-    data: Data,
-    data_flags: BitFlags<DATA_Flags, u8>,
-    reader: &mut Reader<timer_state::Init>,
-    mr_state: &MessageReceiverState,
-    topic_cache: &mut TopicCache,
-  ) {
-    reader.handle_data_msg(data, data_flags, mr_state, topic_cache);
-  }
-
   #[cfg(feature = "security")]
   fn decode_and_handle_data(
     security_plugins: Option<&SecurityPluginsHandle>,
@@ -543,40 +408,6 @@ impl MessageReceiver {
       })
       // Errors have already been printed
       .ok();
-  }
-
-  #[cfg(not(feature = "security"))]
-  // see security version below
-  fn decode_and_handle_datafrag(
-    _security_plugins: Option<&SecurityPluginsHandle>,
-    _source_guid: &GUID,
-    datafrag: DataFrag,
-    datafrag_flags: BitFlags<DATAFRAG_Flags, u8>,
-    reader: &mut Reader<timer_state::Init>,
-    mr_state: &MessageReceiverState,
-    topic_cache: &mut TopicCache,
-  ) {
-    let payload_buffer_length = datafrag.serialized_payload.len();
-    if payload_buffer_length
-      > (datafrag.fragments_in_submessage as usize) * (datafrag.fragment_size as usize)
-    {
-      error!(
-        "{:?}",
-        std::io::Error::new(
-          std::io::ErrorKind::Other,
-          format!(
-            "Invalid DataFrag. serializedData length={} should be less than or equal to \
-             (fragments_in_submessage={}) x (fragment_size={})",
-            payload_buffer_length, datafrag.fragments_in_submessage, datafrag.fragment_size
-          ),
-        )
-      );
-      // and we're done
-    } else {
-      reader.handle_datafrag_msg(&datafrag, datafrag_flags, mr_state, topic_cache);
-    }
-    // Consume to keep the same method signature as in the security case
-    drop(datafrag);
   }
 
   #[cfg(feature = "security")]
@@ -645,50 +476,6 @@ impl MessageReceiver {
         topic_cache,
       );
     });
-  }
-
-  fn handle_reader_submessage(&self, submessage: ReaderSubmessage) -> Option<SubmessageSideEffect> {
-    if self.dest_guid_prefix != self.own_guid_prefix && self.dest_guid_prefix != GuidPrefix::UNKNOWN
-    {
-      debug!(
-        "Message is not for this participant. Dropping. dest_guid_prefix={:?} participant \
-         guid={:?}",
-        self.dest_guid_prefix, self.own_guid_prefix
-      );
-      return None;
-    }
-
-    #[cfg(feature = "security")]
-    if self.must_be_rtps_protection_special_case {
-      match submessage.receiver_entity_id() {
-        // These submessages are the special case
-        EntityId::SPDP_BUILTIN_PARTICIPANT_WRITER
-        | EntityId::P2P_BUILTIN_PARTICIPANT_STATELESS_WRITER
-        | EntityId::P2P_BUILTIN_PARTICIPANT_VOLATILE_SECURE_WRITER => (),
-        // Otherwise we have to reject
-        other => {
-          error!(
-            "Received an unprotected message containing a reader submessage for the writer \
-             {other:?} in an rtps-protected domain."
-          );
-          return None;
-        }
-      }
-    }
-
-    match submessage {
-      ReaderSubmessage::AckNack(acknack, _) => {
-        return Some(SubmessageSideEffect::AckNack(
-          self.source_guid_prefix,
-          AckSubmessage::AckNack(acknack),
-        ))
-      }
-
-      ReaderSubmessage::NackFrag(_, _) => {
-        // TODO: Implement NackFrag handling
-        return None;
-      }
-    }
   }
 
   #[cfg(feature = "security")]

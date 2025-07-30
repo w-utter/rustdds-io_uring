@@ -5,7 +5,7 @@ use io_uring_buf_ring::{buf_ring_state, BufRing};
 use crate::network;
 
 const MAX_MESSAGE_SIZE: usize = 64 * 1024; // This is max we can get from UDP.
-const MESSAGE_BUFFER_ALLOCATION_CHUNK: usize = 256 * 1024; // must be >= MAX_MESSAGE_SIZE
+const MESSAGE_BUFFER_ALLOCATION_CHUNK: usize = (BUFFER_ENTRIES as usize) * MAX_MESSAGE_SIZE; // must be >= MAX_MESSAGE_SIZE
 static_assertions::const_assert!(MESSAGE_BUFFER_ALLOCATION_CHUNK > MAX_MESSAGE_SIZE);
 
 pub struct UDPListener<S> {
@@ -58,11 +58,10 @@ impl UDPListener<buf_ring_state::Uninit> {
 
   pub fn new_unicast(addr: IpAddr, port: u16) -> std::io::Result<Self> {
     let socket = Self::new_listening_socket(addr, port, false)?;
-    const ENTRIES: u16 = 16;
 
     Ok(Self {
       socket,
-      buf: BufRing::new(BUFFER_ENTRIES, MESSAGE_BUFFER_ALLOCATION_CHUNK as _, 0)?,
+      buf: BufRing::new(BUFFER_ENTRIES, MAX_MESSAGE_SIZE as _, 0)?,
       multicast_group: None,
     })
   }

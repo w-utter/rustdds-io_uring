@@ -336,7 +336,7 @@ pub enum WriterCommand {
 }
 
 impl Writer {
-  pub fn new(
+  pub(crate) fn new(
     i: WriterIngredients,
     udp_sender: Rc<UDPSender>,
     mut timed_event_timer: Timer<TimedEvent>,
@@ -1588,7 +1588,7 @@ impl Writer {
       });
   }
 
-  pub fn update_reader_proxy(
+  pub(crate) fn update_reader_proxy(
     &mut self,
     reader_proxy: &RtpsReaderProxy,
     requested_qos: &QosPolicies,

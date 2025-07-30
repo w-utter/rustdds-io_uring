@@ -87,7 +87,7 @@ where
     &self,
     data: D,
     source_timestamp: Option<Timestamp>,
-  ) -> WriteResult<(DataSample<'_, NoKeyWrapper<D>, SAWrapper<SA>>), D> {
+  ) -> WriteResult<DataSample<'_, NoKeyWrapper<D>, SAWrapper<SA>>, D> {
     self
       .keyed_datawriter
       .write(NoKeyWrapper::<D> { d: data }, source_timestamp)

@@ -5,8 +5,6 @@ use std::{
   sync::atomic,
 };
 
-use io_uring::IoUring;
-
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use speedy::{Endianness, Writable};
@@ -284,12 +282,6 @@ impl Timers<timer_state::Init> {
     .unwrap();
 
     self.send_repair_data = Some(timer);
-  }
-
-  fn set_heartbeat_duration(&mut self, duration: Duration) {
-    if let Some(heartbeat) = self.heartbeat.as_mut() {
-      heartbeat.try_update_duration(duration.into(), None)
-    }
   }
 }
 
@@ -1545,7 +1537,7 @@ impl Writer<timer_state::Init> {
     }
   }
 
-  pub fn send_message_to_readers<'a>(
+  pub(crate) fn send_message_to_readers<'a>(
     endianness: Endianness,
     preferred_mode: DeliveryMode,
     message: Message,
@@ -1578,7 +1570,7 @@ impl Writer<timer_state::Init> {
               if already_sent_to.contains(loc) {
                 trace!("Already sent to {:?}", loc);
               } else {
-                udp_sender.send_to_locator(&buffer, loc, ring);
+                udp_sender.send_to_locator(&buffer, loc, ring).unwrap();
                 already_sent_to.insert(loc.clone());
               }
             }
@@ -1637,14 +1629,10 @@ impl Writer<timer_state::Init> {
   }
   */
 
-  pub fn update_reader_proxy(
+  pub(crate) fn update_reader_proxy(
     &mut self,
     reader_proxy: &RtpsReaderProxy,
     requested_qos: &QosPolicies,
-    /*
-    udp_sender: &UDPSender,
-    ring: &mut IoUring,
-    */
   ) -> Option<(DataWriterStatus, DomainParticipantStatusEvent)> {
     debug!("update_reader_proxy topic={:?}", self.my_topic_name);
     match self.qos_policies.compliance_failure_wrt(requested_qos) {
@@ -1664,10 +1652,6 @@ impl Writer<timer_state::Init> {
             local_writer: self.my_guid,
             remote_reader: reader_proxy.remote_reader_guid,
           };
-
-          /*
-          self.handle_heartbeat_tick(false, udp_sender, ring);
-          */
 
           // If we're reliable, should we send out a heartbeat so that new reader can
           // catch up?

@@ -174,6 +174,28 @@ impl RtpsReaderProxy {
     }
   }
 
+  pub fn from_io_uring_reader(
+    remote_reader_guid: GUID,
+    qos: QosPolicies,
+    unicast_locator_list: Vec<Locator>,
+    multicast_locator_list: Vec<Locator>,
+  ) -> Self {
+    Self {
+      remote_reader_guid,
+      remote_group_entity_id: EntityId::UNKNOWN,
+      unicast_locator_list,
+      multicast_locator_list,
+      expects_in_line_qos: false,
+      is_active: true,
+      all_acked_before: SequenceNumber::zero(),
+      unsent_changes: BTreeSet::new(),
+      pending_gap: BTreeSet::new(),
+      repair_mode: false,
+      qos,
+      frags_requested: BTreeMap::new(),
+    }
+  }
+
   fn discovered_or_default(drd: &[Locator], default: &[Locator]) -> Vec<Locator> {
     if drd.is_empty() {
       default.to_vec()

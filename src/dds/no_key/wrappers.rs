@@ -9,7 +9,7 @@ use crate::{dds::adapters::*, messages::submessages::submessages::Representation
 // * the wrapper is good for WITH_KEY
 // The wrapper introduces a dummy key of type (), which of course has an always
 // known value ()
-pub(crate) struct NoKeyWrapper<D> {
+pub struct NoKeyWrapper<D> {
   pub(crate) d: D,
 }
 

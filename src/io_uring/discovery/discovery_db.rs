@@ -1,8 +1,6 @@
-use std::{
-  collections::BTreeMap,
-  sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
-  time::Instant,
-};
+use std::{collections::BTreeMap, time::Instant};
+
+use crate::rtps::rtps_reader_proxy::RtpsReaderProxy;
 
 use chrono::Utc;
 #[allow(unused_imports)]
@@ -11,32 +9,24 @@ use log::{debug, error, info, trace, warn};
 use crate::io_uring::dds::topic::{Topic, TopicDescription};
 use crate::{
   dds::{
-    participant::DomainParticipant,
     qos::HasQoSPolicy,
     statusevents::{DomainParticipantStatusEvent, LostReason},
   },
-  rtps::{
-    reader::ReaderIngredients, rtps_reader_proxy::RtpsReaderProxy,
-    rtps_writer_proxy::RtpsWriterProxy,
-  },
+  rtps::{rtps_writer_proxy::RtpsWriterProxy},
   structure::{
     duration::Duration,
-    entity::RTPSEntity,
     guid::{EntityId, GuidPrefix, GUID},
   },
 };
 use crate::discovery::{
   sedp_messages::{
     topics_inconsistent, DiscoveredReaderData, DiscoveredTopicData, DiscoveredWriterData,
-    ParticipantMessageData, ReaderProxy, SubscriptionBuiltinTopicData, TopicBuiltinTopicData,
-    WriterProxy,
+    ParticipantMessageData, ReaderProxy, TopicBuiltinTopicData, WriterProxy,
   },
   spdp_participant_data::SpdpDiscoveredParticipantData,
 };
-#[cfg(not(feature = "security"))]
-use crate::no_security::EndpointSecurityInfo;
 #[cfg(feature = "security")]
-use crate::{discovery::secure_discovery::AuthenticationStatus, security::EndpointSecurityInfo};
+use crate::discovery::secure_discovery::AuthenticationStatus;
 
 // If remote participant does not specify lease duration, how long silence
 // until we pronounce it dead.
@@ -93,24 +83,6 @@ fn move_by_guid_prefix<D>(
   let to_move: Vec<GUID> = from.range(guid_prefix.range()).map(|(g, _)| *g).collect();
   for guid in to_move {
     from.remove(&guid).map(|d| to.insert(guid, d));
-  }
-}
-
-pub(crate) fn discovery_db_read(
-  discovery_db: &Arc<RwLock<DiscoveryDB>>,
-) -> RwLockReadGuard<DiscoveryDB> {
-  match discovery_db.read() {
-    Ok(db) => db,
-    Err(e) => panic!("DiscoveryDB is poisoned {:?}.", e),
-  }
-}
-
-pub(crate) fn discovery_db_write(
-  discovery_db: &Arc<RwLock<DiscoveryDB>>,
-) -> RwLockWriteGuard<DiscoveryDB> {
-  match discovery_db.write() {
-    Ok(db) => db,
-    Err(e) => panic!("DiscoveryDB is poisoned {:?}.", e),
   }
 }
 
@@ -542,7 +514,7 @@ impl DiscoveryDB {
   // Topic update sends notifications, in case someone was waiting to find a
   // topic. Return value indicates whether the topic (name) was new to us. This
   // is used to add
-  pub fn update_topic_data(
+  pub(crate) fn update_topic_data(
     &mut self,
     dtd: &DiscoveredTopicData,
     updater: GUID,
@@ -550,7 +522,6 @@ impl DiscoveryDB {
   ) -> Option<DomainParticipantStatusEvent> {
     trace!("Update topic data: {:?}", &dtd);
     let topic_name = dtd.topic_data.name.clone();
-    let mut notify = false;
     let mut inconsistency_event_to_send = None;
 
     if let Some(t) = self.topics.get_mut(&dtd.topic_data.name) {
@@ -562,7 +533,6 @@ impl DiscoveryDB {
           // Is it even triggered ever?
           if discovered_via == DiscoveredVia::Topic {
             *old_dtd = (discovered_via, dtd.clone()); // update QoS
-            notify = true;
           } else {
             debug!(
               "Topic {:?} update ignored from {:?}. Already have this.",
@@ -604,7 +574,6 @@ impl DiscoveryDB {
         // We have to topic, but not from this participant
         // TODO: Check that there is agreement about topic type name (at least)
         t.insert(updater, (discovered_via, dtd.clone())); // this should return None
-        notify = true;
       }
     } else {
       // new topic to us

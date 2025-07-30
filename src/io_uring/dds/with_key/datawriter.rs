@@ -11,7 +11,6 @@ use crate::{
   dds::{
     adapters::with_key::SerializerAdapter,
     ddsdata::DDSData,
-    pubsub::Publisher,
     qos::{policy::Liveliness, HasQoSPolicy, QosPolicies},
     result::{WriteError, WriteResult},
   },
@@ -104,11 +103,8 @@ pub struct DataSample<'a, D: Keyed, SA: SerializerAdapter<D>> {
   refresh_manual_liveliness: bool,
 }
 
-use crate::io_uring::rtps::{Domain, DomainRef};
-use crate::io_uring::discovery::Discovery2;
-use crate::io_uring::timer::timer_state;
-use io_uring_buf_ring::buf_ring_state;
-use crate::io_uring::network::UDPSender;
+use crate::io_uring::rtps::DomainRef;
+
 impl<D: Keyed, SA: SerializerAdapter<D>> DataSample<'_, D, SA> {
   pub fn write_to(self, domain: &mut DomainRef<'_, '_>) {
     let Self {
@@ -164,12 +160,6 @@ where
         .available_sequence_number
         .fetch_add(1, Ordering::Relaxed),
     )
-  }
-
-  fn undo_sequence_number(&self) {
-    self
-      .available_sequence_number
-      .fetch_sub(1, Ordering::Relaxed);
   }
 
   fn discovery_cmd_from_qos(qos: &QosPolicies) -> bool {
@@ -278,8 +268,6 @@ where
       sequence_number,
     };
 
-    let timeout = self.qos().reliable_max_blocking_time();
-
     let sample_identity = SampleIdentity {
       writer_guid: self.my_guid,
       sequence_number,
@@ -337,7 +325,7 @@ where
   /// data_writer.write(some_data, None).unwrap();
   /// data_writer.wait_for_acknowledgments(std::time::Duration::from_millis(100));
   /// ```
-  pub fn wait_for_acknowledgments(&self, max_wait: Duration) -> WriteResult<bool, ()> {
+  pub fn wait_for_acknowledgments(&self, _max_wait: Duration) -> WriteResult<bool, ()> {
     //TODO: find a better way for this
     // maybe (timer fd, can cancel it with the encoding and then handle it from there)
     todo!()

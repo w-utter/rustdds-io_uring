@@ -76,8 +76,8 @@ pub struct ReaderIngredients {
   pub(crate) topic_cache_handle: Arc<Mutex<TopicCache>>, /* A handle to the topic cache in DDS
                                                           * cache */
   pub(crate) like_stateless: bool, // Usually false (see like_stateless attribute of Reader)
-  pub qos_policy: QosPolicies,
-  pub data_reader_command_receiver: mio_channel::Receiver<ReaderCommand>,
+  pub(crate) qos_policy: QosPolicies,
+  pub(crate) data_reader_command_receiver: mio_channel::Receiver<ReaderCommand>,
   pub(crate) data_reader_waker: Arc<Mutex<Option<Waker>>>,
   pub(crate) poll_event_sender: mio_source::PollEventSender,
 
@@ -383,7 +383,7 @@ impl Reader {
   }
 
   // updates or adds a new writer proxy, doesn't touch changes
-  pub fn update_writer_proxy(&mut self, proxy: RtpsWriterProxy, offered_qos: &QosPolicies) {
+  pub(crate) fn update_writer_proxy(&mut self, proxy: RtpsWriterProxy, offered_qos: &QosPolicies) {
     if self.like_stateless {
       debug!(
         "Attempted to update writer proxy for stateless reader. Ignoring. topic={:?}",

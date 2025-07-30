@@ -3,13 +3,10 @@ use crate::io_uring::dds::topic::Topic;
 use crate::io_uring::dds::cache::DDSCache;
 use crate::io_uring::discovery::DiscoveryDB;
 use crate::io_uring::network::UDPSender;
-use crate::io_uring::dds::with_key::DataWriter;
-use crate::io_uring::dds::with_key::DataReader;
+use crate::io_uring::dds::{with_key, no_key};
 use crate::dds::CreateResult;
-use crate::CDRDeserializerAdapter;
 
 use crate::GUID;
-use crate::structure::guid::GuidPrefix;
 use crate::structure::guid::EntityKind;
 use crate::EntityId;
 
@@ -96,9 +93,6 @@ pub struct Publisher<'a, 'q> {
 use crate::with_key::SerializerAdapter;
 use crate::Keyed;
 
-use crate::CDRSerializerAdapter;
-use byteorder::LittleEndian;
-
 impl Publisher<'_, '_> {
   pub fn create_datawriter_cdr<D: Keyed + serde::Serialize>(
     &mut self,
@@ -108,7 +102,7 @@ impl Publisher<'_, '_> {
     ring: &mut IoUring,
     discovery: &mut Discovery2<timer_state::Init>,
     udp_sender: &UDPSender,
-  ) -> DataWriter<D, CDRSerializerAdapter<D, LittleEndian>>
+  ) -> with_key::DataWriterCdr<D>
   where
     <D as Keyed>::K: serde::Serialize,
   {
@@ -122,7 +116,7 @@ impl Publisher<'_, '_> {
     ring: &mut IoUring,
     discovery: &mut Discovery2<timer_state::Init>,
     udp_sender: &UDPSender,
-  ) -> DataWriter<D, SA> {
+  ) -> with_key::DataWriter<D, SA> {
     //1) pubsub line 160
     //2) pubsub line 446
     use crate::dds::qos::HasQoSPolicy;
@@ -139,7 +133,7 @@ impl Publisher<'_, '_> {
     let guid = GUID::new(self.participant.guid.prefix, entity_id);
 
     let (datawriter, manual_assertion) =
-      DataWriter::<D, SA>::new(self.topic.clone(), writer_qos.clone(), guid);
+      with_key::DataWriter::<D, SA>::new(self.topic.clone(), writer_qos.clone(), guid);
 
     let crate::io_uring::discovery::traffic::UserTrafficLocators {
       unicast_user_traffic,
@@ -150,8 +144,6 @@ impl Publisher<'_, '_> {
     let discovered_data = DiscoveredWriterData::new_io_uring(
       &datawriter,
       self.topic,
-      domain.domain_info.domain_id,
-      domain.domain_info.participant_id,
       self.participant.guid,
       None,
       unicast_user_traffic,
@@ -164,7 +156,7 @@ impl Publisher<'_, '_> {
     use crate::io_uring::dds::topic::TopicDescription;
 
     let writer_like_stateless = false;
-    use crate::io_uring::rtps::{Writer, WriterIngredients};
+    use crate::io_uring::rtps::WriterIngredients;
     let writer_ing = WriterIngredients {
       guid,
       topic_name: self.topic.name(),
@@ -173,7 +165,9 @@ impl Publisher<'_, '_> {
       security_plugins: None,
     };
 
-    domain.add_local_writer(writer_ing, ring).unwrap();
+    domain
+      .add_local_writer(writer_ing, udp_sender, ring)
+      .unwrap();
 
     discovery.publish_writer(guid, discovery_db, udp_sender, ring);
     discovery.publish_topic(&self.topic.name(), discovery_db, udp_sender, ring);
@@ -184,6 +178,34 @@ impl Publisher<'_, '_> {
         .manual_participant_liveness_refresh_requested = true;
     }
     datawriter
+  }
+
+  pub fn create_datawriter_no_key<D: Keyed, SA: SerializerAdapter<D>>(
+    &mut self,
+    qos: Option<QosPolicies>,
+    discovery_db: &mut DiscoveryDB,
+    domain: &mut Domain<timer_state::Init, buf_ring_state::Init>,
+    ring: &mut IoUring,
+    discovery: &mut Discovery2<timer_state::Init>,
+    udp_sender: &UDPSender,
+  ) -> no_key::DataWriter<D, SA> {
+    let writer = self.create_datawriter(qos, discovery_db, domain, ring, discovery, udp_sender);
+    no_key::DataWriter::from_keyed(writer)
+  }
+
+  pub fn create_datawriter_no_key_cdr<D: Keyed + serde::Serialize>(
+    &mut self,
+    qos: Option<QosPolicies>,
+    discovery_db: &mut DiscoveryDB,
+    domain: &mut Domain<timer_state::Init, buf_ring_state::Init>,
+    ring: &mut IoUring,
+    discovery: &mut Discovery2<timer_state::Init>,
+    udp_sender: &UDPSender,
+  ) -> no_key::DataWriterCdr<D>
+  where
+    <D as Keyed>::K: serde::Serialize,
+  {
+    self.create_datawriter_no_key(qos, discovery_db, domain, ring, discovery, udp_sender)
   }
 }
 
@@ -205,7 +227,7 @@ impl Subscriber<'_, '_> {
     ring: &mut IoUring,
     discovery: &mut Discovery2<timer_state::Init>,
     udp_sender: &UDPSender,
-  ) -> CreateResult<DataReader<D, CDRDeserializerAdapter<D>>>
+  ) -> CreateResult<with_key::DataReaderCdr<D>>
   where
     <D as Keyed>::K: serde::de::DeserializeOwned,
   {
@@ -229,7 +251,7 @@ impl Subscriber<'_, '_> {
     ring: &mut IoUring,
     discovery: &mut Discovery2<timer_state::Init>,
     udp_sender: &UDPSender,
-  ) -> CreateResult<DataReader<D, SA>> {
+  ) -> CreateResult<with_key::DataReader<D, SA>> {
     let simple = self.create_simple_datareader(
       qos,
       dds_cache,
@@ -240,7 +262,7 @@ impl Subscriber<'_, '_> {
       udp_sender,
     )?;
 
-    Ok(DataReader::from_simple_data_reader(simple))
+    Ok(with_key::DataReader::from_simple_data_reader(simple))
   }
 
   fn create_simple_datareader<D: Keyed + 'static, SA: DeserializerAdapter<D>>(
@@ -293,7 +315,8 @@ impl Subscriber<'_, '_> {
       multicast_user_traffic,
     } = domain.listeners.user_traffic_locators();
 
-    let proxy = crate::io_uring::rtps::RtpsReaderProxy::new(
+    use crate::rtps::rtps_reader_proxy::RtpsReaderProxy;
+    let proxy = RtpsReaderProxy::from_io_uring_reader(
       guid,
       reader_qos.clone(),
       unicast_user_traffic,
@@ -328,5 +351,52 @@ impl Subscriber<'_, '_> {
     discovery.publish_topic(&self.topic.name(), discovery_db, udp_sender, ring);
 
     SimpleDataReader::new(guid.prefix, guid.entity_id, self.topic.clone(), reader_qos)
+  }
+
+  pub fn create_datareader_no_key<D: Keyed + 'static, SA: DeserializerAdapter<D>>(
+    &mut self,
+    qos: Option<QosPolicies>,
+    dds_cache: &mut DDSCache,
+    discovery_db: &mut DiscoveryDB,
+    domain: &mut Domain<timer_state::Init, buf_ring_state::Init>,
+    ring: &mut IoUring,
+    discovery: &mut Discovery2<timer_state::Init>,
+    udp_sender: &UDPSender,
+  ) -> CreateResult<no_key::DataReader<D, SA>> {
+    let reader = self.create_datareader(
+      qos,
+      dds_cache,
+      discovery_db,
+      domain,
+      ring,
+      discovery,
+      udp_sender,
+    )?;
+
+    Ok(no_key::DataReader::from_keyed(reader))
+  }
+
+  pub fn create_datareader_no_key_cdr<D: Keyed + serde::de::DeserializeOwned + 'static>(
+    &mut self,
+    qos: Option<QosPolicies>,
+    dds_cache: &mut DDSCache,
+    discovery_db: &mut DiscoveryDB,
+    domain: &mut Domain<timer_state::Init, buf_ring_state::Init>,
+    ring: &mut IoUring,
+    discovery: &mut Discovery2<timer_state::Init>,
+    udp_sender: &UDPSender,
+  ) -> CreateResult<no_key::DataReaderCdr<D>>
+  where
+    <D as Keyed>::K: serde::de::DeserializeOwned,
+  {
+    self.create_datareader_no_key(
+      qos,
+      dds_cache,
+      discovery_db,
+      domain,
+      ring,
+      discovery,
+      udp_sender,
+    )
   }
 }

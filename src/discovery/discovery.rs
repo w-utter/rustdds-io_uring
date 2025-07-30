@@ -111,8 +111,8 @@ pub enum DiscoveryCommand {
 }
 
 pub struct LivelinessState {
-  last_auto_update: Timestamp,
-  manual_participant_liveness_refresh_requested: bool,
+  pub(crate) last_auto_update: Timestamp,
+  pub(crate) manual_participant_liveness_refresh_requested: bool,
 }
 
 impl LivelinessState {

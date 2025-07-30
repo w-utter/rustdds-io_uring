@@ -6,6 +6,8 @@ use enumflags2::BitFlags;
 use speedy::{Endianness, Writable};
 use crate::io_uring::network::UDPSender;
 
+use crate::io_uring::encoding::user_data::ReadTimerVariant;
+
 use crate::{
   dds::{
     ddsdata::DDSData,
@@ -13,7 +15,6 @@ use crate::{
     statusevents::{CountWithChange, DataReaderStatus, DomainParticipantStatusEvent},
     with_key::{
       datawriter::{WriteOptions, WriteOptionsBuilder},
-      simpledatareader::ReaderCommand,
     },
   },
   messages::{
@@ -50,8 +51,6 @@ use super::Submessage;
 use crate::security::{security_plugins::SecurityPluginsHandle, SecurityResult};
 #[cfg(not(feature = "security"))]
 use crate::no_security::SecurityPluginsHandle;
-
-use crate::rtps::reader::TimedEvent;
 
 // Some pieces necessary to construct a reader.
 // These can be sent between threads, whereas a Reader cannot.
@@ -305,10 +304,10 @@ impl Reader<timer_state::Init> {
 
   pub fn handle_timed_event(
     &mut self,
-    event: TimedEvent,
+    event: ReadTimerVariant,
   ) -> impl Iterator<Item = DataReaderStatus> + use<'_> {
     match event {
-      TimedEvent::DeadlineMissedCheck => {
+      ReadTimerVariant::RequestedDeadline => {
         //TODO:
 
         self.set_requested_deadline_check_timer(); // re-prime timer
@@ -317,7 +316,8 @@ impl Reader<timer_state::Init> {
     }
   }
 
-  pub fn process_command(&mut self, cmd: ReaderCommand) {
+  /*
+  pub(crate) fn process_command(&mut self, cmd: ReaderCommand) {
     trace!("process_command {:?}", self.my_guid);
     match cmd {
       ReaderCommand::ResetRequestedDeadlineStatus => {
@@ -326,6 +326,7 @@ impl Reader<timer_state::Init> {
       }
     }
   }
+  */
 
   fn handle_requested_deadline_event(
     &mut self,
@@ -364,7 +365,7 @@ impl Reader<timer_state::Init> {
   }
 
   // updates or adds a new writer proxy, doesn't touch changes
-  pub fn update_writer_proxy(
+  pub(crate) fn update_writer_proxy(
     &mut self,
     proxy: RtpsWriterProxy,
     offered_qos: &QosPolicies,
@@ -1223,7 +1224,9 @@ impl Reader<timer_state::Init> {
       .write_to_vec_with_ctx(Endianness::LittleEndian)
       .unwrap(); //TODO!
     let _dummy = message; // consume it to avoid clippy warning
-    udp_sender.send_to_locator_list(&bytes, dst_locator_list, ring);
+    udp_sender
+      .send_to_locator_list(&bytes, dst_locator_list, ring)
+      .unwrap();
   }
 
   #[cfg(feature = "security")]
