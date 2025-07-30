@@ -1440,9 +1440,90 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
     }
   }
 
+  pub(crate) fn minimal_hb(&mut self) -> MinimalHBData<'_> {
+      let heartbeat_count = self.next_heartbeat_count();
+      let Self {
+          history_buffer,
+          reader_proxies,
+          writer_guid,
+          ..
+      } = self;
+
+      MinimalHBData {
+          history_buffer,
+          reader_proxies,
+          writer_guid: *writer_guid,
+          heartbeat_count,
+      }
+  }
+
   fn handle_reader_timed_event(&mut self, _ev: &user_data::ReadTimerVariant) {
     todo!()
   }
+}
+
+pub(crate) struct MinimalHBData<'a> {
+    pub(crate) history_buffer: &'a HistoryBuffer,
+    pub(crate) reader_proxies: &'a BTreeMap<GUID, RtpsReaderProxy>,
+    pub(crate) writer_guid: GUID,
+    pub(crate) heartbeat_count: i32,
+}
+
+impl MinimalHBData<'_> {
+    pub(crate) fn send_inital_cache_change(self, udp_sender: &UDPSender, ring: &mut IoUring) {
+        let Self {
+            history_buffer,
+            reader_proxies,
+            writer_guid,
+            heartbeat_count,
+        } = self;
+
+        let final_flag = false;
+        let liveliness_flag = false;
+
+        let first_change = history_buffer.first_change_sequence_number();
+        let last_change = history_buffer.last_change_sequence_number();
+
+        if reader_proxies
+          .values()
+          .all(|rp| last_change < rp.all_acked_before)
+        {
+          trace!("heartbeat tick: all readers have all available data.");
+          return;
+        }
+
+        use crate::rtps::MessageBuilder;
+        use crate::rtps::writer::DeliveryMode;
+        use speedy::Endianness;
+
+        let endianness = speedy::Endianness::LittleEndian;
+
+        // the interface to .heartbeat_msg is silly: we give ref to ourself
+        // and that function then queries us.
+        let hb_message = MessageBuilder::new()
+          .ts_msg(endianness, Some(Timestamp::now()))
+          .heartbeat_msg(
+            writer_guid.entity_id, // from Writer
+            first_change,
+            last_change,
+            heartbeat_count,
+            endianness,
+            EntityId::UNKNOWN, // to Reader
+            final_flag,
+            liveliness_flag,
+          )
+          .add_header_and_build(writer_guid.prefix);
+
+          crate::io_uring::rtps::Writer::send_message_to_readers(
+            Endianness::LittleEndian,
+            DeliveryMode::Multicast,
+            hb_message,
+            reader_proxies.values(),
+            udp_sender,
+            ring,
+          );
+        
+    }
 }
 
 use crate::messages::submessages::submessages::ACKNACK_Flags;

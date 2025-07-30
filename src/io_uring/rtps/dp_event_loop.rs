@@ -160,8 +160,9 @@ impl Domain<timer_state::Init, buf_ring_state::Init> {
     discovery_db: &mut DiscoveryDB,
     udp_sender: &UDPSender,
     dds_cache: &mut DDSCache,
-    mut f: impl FnMut(DomainRef<'_, '_>, DomainStatusEvent),
-    mut f2: impl FnMut(&str, &mut TopicCache),
+    mut on_data_status: impl FnMut(DataStatus, GUID),
+    mut on_participant_status: impl FnMut(DomainParticipantStatusEvent),
+    mut on_read: impl FnMut(&str, &mut TopicCache),
   ) -> Option<()> {
     use crate::io_uring::encoding::{UserData, user_data::*};
     let entry = ring.completion().next()?;
@@ -177,6 +178,10 @@ impl Domain<timer_state::Init, buf_ring_state::Init> {
         drop(buf_id);
 
         let mut submsgs = self.message_receiver.handle_received_packet_2(&bytes)?;
+
+        // let f = |hb| hb.send_initial_cache_change(udp_sender, ring);
+        // move this (&F: Fn(HbMsg) -> ()) to the
+
         while let Some(submsg) = submsgs.next() {
           let msg_recv = &mut *submsgs.msg_recv;
 
@@ -185,60 +190,26 @@ impl Domain<timer_state::Init, buf_ring_state::Init> {
               match discovery.handle_writer_msg(msg, &state, discovery_db, udp_sender, ring) {
                 // builtin
                 Ok(Some(mut changes)) => {
-                  let mut state = None;
+                  //let mut state = None;
 
                   let readers = &mut msg_recv.available_readers;
 
                   //let caches: &mut Caches<timer_state::Init> = unsafe {&mut*(&mut discovery.caches as *mut _)};
 
-                  let mut upd = DDIState::new(
-                    discovery,
-                    discovery_db,
-                    readers,
-                    &mut self.writers,
-                    &mut changes,
-                    &mut state,
-                    ring,
-                    udp_sender,
-                  );
-
-                  while let Some(ev) = upd.next() {
-                    match &ev {
-                      DomainStatusEvent::Data(status, guid)
-                      | DomainStatusEvent::Mixed(_, (status, guid)) => match status {
-                        DataStatus::Writer(status) => match status {
-                          DataWriterStatus::PublicationMatched { .. } => {
-                            println!("\npublication: {:?}\n", guid.entity_id);
-                            if let Some(writer) = upd.writers.get_mut(&guid.entity_id) {
-                              writer.handle_heartbeat_tick(false, upd.udp_sender, upd.ring);
-                              println!("sending inital heartbeat");
-                            } else {
-                              //let caches = &mut upd.discovery.caches;
-                              match guid.entity_id {
-                                //EntityId::SPDP_BUILTIN_PARTICIPANT_WRITER => caches.participants.handle_heartbeat_tick(false, udp_sender, upd.ring),
-                                //EntityId::SEDP_BUILTIN_SUBSCRIPTIONS_WRITER => caches.subscriptions.handle_heartbeat_tick(false, udp_sender, upd.ring),
-                                /*
-                                EntityId::SEDP_BUILTIN_PUBLICATIONS_WRITER => caches.publications.handle_heartbeat_tick(false, udp_sender, upd.ring),
-                                */
-                                /*
-                                EntityId::SEDP_BUILTIN_TOPIC_WRITER => caches.topics.handle_heartbeat_tick(false, udp_sender, upd.ring),
-                                */
-                                _ => (),
-                              }
-                              //upd.discovery.caches.handle_timed_event(Timer::Write(guid.entity_id, WriteTimerVariant::Heartbeat), udp_sender, upd.ring);
-                            }
+                  iterate_events(discovery, discovery_db, readers, &mut self.writers, &mut changes, ring, udp_sender, |ev| match ev {
+                      DomainStatusEvent::Participant(p) => on_participant_status(p),
+                      DomainStatusEvent::Data(d, guid) => {
+                          if guid.entity_id.entity_kind.is_user_defined() {
+                              on_data_status(d, guid);
                           }
-                          _ => (),
-                        },
-                        _ => (),
                       },
-                      _ => (),
-                    }
-                    f(
-                      DomainRef::new(upd.writers, upd.ring, upd.discovery, udp_sender),
-                      ev,
-                    );
-                  }
+                      DomainStatusEvent::Mixed(p, (d, guid)) => {
+                          on_participant_status(p);
+                          if guid.entity_id.entity_kind.is_user_defined() {
+                              on_data_status(d, guid);
+                          }
+                      }
+                  });
                 }
                 Ok(None) => return None,
                 //not a builtin.
@@ -271,7 +242,7 @@ impl Domain<timer_state::Init, buf_ring_state::Init> {
                           continue;
                         }
                         let topic = &reader.topic_name;
-                        f2(topic, topic_cache);
+                        on_read(topic, topic_cache);
                       }
                       WriterSubmessage::Heartbeat(heartbeat, flags) => {
                         use crate::messages::submessages::submessages::HEARTBEAT_Flags;
@@ -351,15 +322,20 @@ impl Domain<timer_state::Init, buf_ring_state::Init> {
             );
 
             while let Some(lost_participant) = lost_cleanup.next() {
-              f(
-                DomainRef::new(
-                  lost_cleanup.writers,
-                  ring,
-                  lost_cleanup.discovery,
-                  udp_sender,
-                ),
-                lost_participant,
-              );
+                match lost_participant {
+                      DomainStatusEvent::Participant(p) => on_participant_status(p),
+                      DomainStatusEvent::Data(d, guid) => {
+                          if guid.entity_id.entity_kind.is_user_defined() {
+                              on_data_status(d, guid);
+                          }
+                      },
+                      DomainStatusEvent::Mixed(p, (d, guid)) => {
+                          on_participant_status(p);
+                          if guid.entity_id.entity_kind.is_user_defined() {
+                              on_data_status(d, guid);
+                          }
+                      }
+                }
             }
           }
           BuiltinTimerVariant::TopicCleaning => {
@@ -534,17 +510,19 @@ impl<'a> Builtins<'a> {
   }
 }
 
-struct UpdatedParticipant2<'a> {
+struct UpdatedParticipant2<'a, F> {
   builtins: Builtins<'a>,
   writers_list: vec::IntoIter<(EntityId, EntityId, u32)>,
   readers_list: vec::IntoIter<(EntityId, EntityId, u32)>,
   discovered_participant: crate::discovery::SpdpDiscoveredParticipantData,
+  f: F,
 }
 
-impl<'a> UpdatedParticipant2<'a> {
+impl<'a, F> UpdatedParticipant2<'a, F> {
   fn new(
     caches: &'a mut Caches<timer_state::Init>,
     discovered_participant: crate::discovery::SpdpDiscoveredParticipantData,
+    f: F,
   ) -> Self {
     let builtins = Builtins::new(caches);
     let writers_list = crate::rtps::constant::STANDARD_BUILTIN_WRITERS_INIT_LIST
@@ -559,11 +537,14 @@ impl<'a> UpdatedParticipant2<'a> {
       writers_list,
       readers_list,
       discovered_participant,
+      f,
     }
   }
 }
 
-impl<'a> Iterator for UpdatedParticipant2<'a> {
+impl<'a, F> Iterator for UpdatedParticipant2<'a, F> 
+where F: FnMut(MinimalHBData)
+{
   type Item = DomainStatusEvent;
 
   fn next(&mut self) -> Option<Self::Item> {
@@ -587,28 +568,44 @@ impl<'a> Iterator for UpdatedParticipant2<'a> {
             publications: Some(cache),
             ..
           },
-        ) => (cache.update_reader_proxy(&reader_proxy), cache.writer_guid),
+        ) => {
+            let ret = cache.update_reader_proxy(&reader_proxy);
+            //(self.f)(cache.minimal_hb());
+            (ret, cache.writer_guid)
+        }
         (
           EntityId::SEDP_BUILTIN_TOPIC_WRITER,
           Builtins {
             topics: Some(cache),
             ..
           },
-        ) => (cache.update_reader_proxy(&reader_proxy), cache.writer_guid),
+        ) => {
+            let ret = cache.update_reader_proxy(&reader_proxy);
+            //(self.f)(cache.minimal_hb());
+            (ret, cache.writer_guid)
+        }
         (
           EntityId::SPDP_BUILTIN_PARTICIPANT_WRITER,
           Builtins {
             participants: Some(cache),
             ..
           },
-        ) => (cache.update_reader_proxy(&reader_proxy), cache.writer_guid),
+        ) => {
+            let ret = cache.update_reader_proxy(&reader_proxy);
+            (self.f)(cache.minimal_hb());
+            (ret, cache.writer_guid)
+        }
         (
           EntityId::SEDP_BUILTIN_SUBSCRIPTIONS_WRITER,
           Builtins {
             subscriptions: Some(cache),
             ..
           },
-        ) => (cache.update_reader_proxy(&reader_proxy), cache.writer_guid),
+        ) => {
+            let ret = cache.update_reader_proxy(&reader_proxy);
+            (self.f)(cache.minimal_hb());
+            (ret, cache.writer_guid)
+        }
         (
           EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_WRITER,
           Builtins {
@@ -624,9 +621,14 @@ impl<'a> Iterator for UpdatedParticipant2<'a> {
           {
             let mut qos = qos.clone();
             qos.reliability = Some(policy::Reliability::BestEffort);
-            cache.update_reader_proxy_with_qos(&reader_proxy, &qos)
+
+            let ret = cache.update_reader_proxy_with_qos(&reader_proxy, &qos);
+            (self.f)(cache.minimal_hb());
+            ret
           } else {
-            cache.update_reader_proxy(&reader_proxy)
+            let ret = cache.update_reader_proxy(&reader_proxy);
+            (self.f)(cache.minimal_hb());
+            ret
           };
           (upd, cache.writer_guid)
         }
@@ -987,63 +989,75 @@ use crate::{
 
 use crate::rtps::dp_event_loop::DomainInfo;
 
-struct DiscoveredUpdates2<C, U> {
+struct DiscoveredUpdates2<C, U, F> {
   remote: C,
   remote_discovered: U,
+  f: F,
 }
 
-type DiscoveredReaderUpdates2<'a> = DiscoveredUpdates2<
+type DiscoveredReaderUpdates2<'a, F> = DiscoveredUpdates2<
   hash_map::ValuesMut<'a, EntityId, Writer<timer_state::Init>>,
   DiscoveredReaderData,
+  F,
 >;
 
-impl<'a>
+impl<'a, F>
   DiscoveredUpdates2<
     hash_map::ValuesMut<'a, EntityId, Writer<timer_state::Init>>,
     DiscoveredReaderData,
+    F,
   >
 {
   fn new_reader_data(
     map: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
     reader_data: DiscoveredReaderData,
+    f: F,
   ) -> Self {
     Self {
       remote: map.values_mut(),
       remote_discovered: reader_data,
+      f,
     }
   }
 }
 
-type DiscoveredWriterUpdates2<'a> = DiscoveredUpdates2<
+type DiscoveredWriterUpdates2<'a, F> = DiscoveredUpdates2<
   btree_map::ValuesMut<'a, EntityId, Reader<timer_state::Init>>,
   DiscoveredWriterData,
+  F,
 >;
 
-impl<'a>
+impl<'a, F>
   DiscoveredUpdates2<
     btree_map::ValuesMut<'a, EntityId, Reader<timer_state::Init>>,
     DiscoveredWriterData,
+    F,
   >
 {
   fn new_writer_data(
     map: &'a mut BTreeMap<EntityId, Reader<timer_state::Init>>,
     writer_data: DiscoveredWriterData,
+    f: F,
   ) -> Self {
     Self {
       remote: map.values_mut(),
       remote_discovered: writer_data,
+      f,
     }
   }
 }
 
 use std::collections::hash_map;
 
-impl<'a> Iterator
+impl<'a, F> Iterator
   for DiscoveredUpdates2<
     hash_map::ValuesMut<'a, EntityId, Writer<timer_state::Init>>,
     DiscoveredReaderData,
+    F,
   >
+where F: FnMut(MinimalHBData)
 {
+
   type Item = (DataWriterStatus, DomainParticipantStatusEvent);
 
   fn next(&mut self) -> Option<Self::Item> {
@@ -1076,11 +1090,13 @@ impl<'a> Iterator
 
 use std::collections::btree_map;
 
-impl<'a> Iterator
+impl<'a, F> Iterator
   for DiscoveredUpdates2<
     btree_map::ValuesMut<'a, EntityId, Reader<timer_state::Init>>,
     DiscoveredWriterData,
+    F,
   >
+where F: FnMut(MinimalHBData)
 {
   type Item = (DataReaderStatus, DomainParticipantStatusEvent);
 
@@ -1119,6 +1135,7 @@ pub enum DataStatus {
   Writer(DataWriterStatus),
 }
 
+/*
 struct DDIState<'a, 'c, 'd, 'e, 'f> {
   pub(crate) discovery: &'c mut Discovery2<timer_state::Init>,
   pub(crate) discovery_db: &'d mut DiscoveryDB,
@@ -1245,17 +1262,67 @@ impl<'a, 'c, 'd, 'e, 'f> Iterator for DDIState<'a, 'c, 'd, 'e, 'f> {
     None
   }
 }
+*/
 
-enum DState<'a, 'b> {
-  ReaderLost(LostReaderUpdates<'a>),
-  ReaderUpdates(DiscoveredReaderUpdates2<'a>),
-  WriterLost(LostWriterUpdates<'a>),
-  WriterUpdates(DiscoveredWriterUpdates2<'a>),
-  ParticipantLost(LostParticipant2<'a, 'b>),
-  ParticipantUpdates(UpdatedParticipant2<'b>),
+use crate::io_uring::discovery::MinimalHBData;
+
+fn iterate_events(
+  discovery: &mut Discovery2<timer_state::Init>,
+  discovery_db: &mut DiscoveryDB,
+  readers: &mut BTreeMap<EntityId, Reader<timer_state::Init>>,
+  writers: &mut HashMap<EntityId, Writer<timer_state::Init>>,
+  discovered: &mut DiscoveredKind,
+  ring: &mut IoUring,
+  udp_sender: &UDPSender,
+  mut f: impl FnMut(DomainStatusEvent),
+) {
+    let mut discovered = Discovered::new(discovery, discovery_db, discovered);
+    while let Some((mut discovery_status, mut status)) = discovered.next() {
+        if let Some(participant_status) = core::mem::take(&mut status) {
+            f(DomainStatusEvent::Participant(participant_status));
+        }
+
+        //SAFETY: there should not be any overlap.
+        // move the ring into each of the fns?
+        let ring_2 = unsafe {&mut *(ring as *mut _)};
+         //it happens regardless???
+        let mut func = |hb: MinimalHBData| 
+            ();
+            //hb.send_inital_cache_change(udp_sender, ring_2);
+
+        let Some((mut dstate, mut status)) = DState::new(
+            discovery_status,
+            readers,
+            writers,
+            &mut discovered.discovery.caches,
+            ring,
+            discovered.discovery_db,
+            udp_sender,
+            &mut func,
+            ) else {
+            continue;
+        };
+
+        if let Some(participant_status) = core::mem::take(&mut status) {
+            f(DomainStatusEvent::Participant(participant_status));
+        }
+
+        while let Some(status) = dstate.next() {
+            f(status);
+        }
+    }
 }
 
-impl<'a, 'b> DState<'a, 'b> {
+enum DState<'a, 'b, F> {
+  ReaderLost(LostReaderUpdates<'a>),
+  ReaderUpdates(DiscoveredReaderUpdates2<'a, F>),
+  WriterLost(LostWriterUpdates<'a>),
+  WriterUpdates(DiscoveredWriterUpdates2<'a, F>),
+  ParticipantLost(LostParticipant2<'a, 'b>),
+  ParticipantUpdates(UpdatedParticipant2<'b, F>),
+}
+
+impl<'a, 'b, F> DState<'a, 'b, F> {
   fn new(
     notif: DiscoveryNotificationType,
     readers: &'a mut BTreeMap<EntityId, Reader<timer_state::Init>>,
@@ -1264,6 +1331,7 @@ impl<'a, 'b> DState<'a, 'b> {
     ring: &mut IoUring,
     discovery_db: &mut DiscoveryDB,
     udp_sender: &UDPSender,
+    f: F,
   ) -> Option<(Self, Option<DomainParticipantStatusEvent>)> {
     use DiscoveryNotificationType as DDT;
 
@@ -1292,6 +1360,7 @@ impl<'a, 'b> DState<'a, 'b> {
         let state = Self::WriterUpdates(DiscoveredWriterUpdates2::new_writer_data(
           readers,
           discovered_writer_data,
+          f,
         ));
 
         Some((state, Some(domain_ev)))
@@ -1324,6 +1393,7 @@ impl<'a, 'b> DState<'a, 'b> {
         let state = Self::ReaderUpdates(DiscoveredReaderUpdates2::new_reader_data(
           writers,
           discovered_reader_data,
+          f,
         ));
 
         Some((state, Some(domain_ev)))
@@ -1337,7 +1407,7 @@ impl<'a, 'b> DState<'a, 'b> {
 
         //FIXME: this may be able to avoid a clone now.
         Some((
-          Self::ParticipantUpdates(UpdatedParticipant2::new(caches, participant_proxy.clone())),
+          Self::ParticipantUpdates(UpdatedParticipant2::new(caches, participant_proxy.clone(), f)),
           None,
         ))
       }
@@ -1359,7 +1429,9 @@ impl<'a, 'b> DState<'a, 'b> {
   }
 }
 
-impl<'a, 'b> Iterator for DState<'a, 'b> {
+impl<'a, 'b, F> Iterator for DState<'a, 'b, F> 
+where F: FnMut(MinimalHBData)
+{
   type Item = DomainStatusEvent;
 
   fn next(&mut self) -> Option<Self::Item> {

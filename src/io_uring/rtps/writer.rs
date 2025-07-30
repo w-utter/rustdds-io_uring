@@ -1800,7 +1800,26 @@ impl Writer<timer_state::Init> {
   // pub fn reset_offered_deadline_missed_status(&mut self) {
   //   self.offered_deadline_status.reset_change();
   // }
+
+  fn minimal_hb_data(&self) -> MinimalHBData<'_> {
+      let heartbeat_count = self.next_heartbeat_count();
+      let Self {
+          history_buffer,
+          readers,
+          my_guid,
+          ..
+      } = self;
+
+      MinimalHBData {
+          history_buffer,
+          reader_proxies: readers,
+          writer_guid: *my_guid,
+          heartbeat_count,
+      }
+  }
 }
+
+use crate::io_uring::discovery::MinimalHBData;
 
 pub struct LostReaders<'a> {
   writer: &'a mut Writer<timer_state::Init>,
