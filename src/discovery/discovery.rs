@@ -135,7 +135,9 @@ mod with_key {
   use mio_extras::timer::Timer;
 
   use super::{DataReaderPlCdr, DataWriterPlCdr};
-  use crate::{polling::TimerPolicy, serialization::pl_cdr_adapters::*, Key, Keyed, Topic, TopicKind};
+  use crate::{
+    polling::TimerPolicy, serialization::pl_cdr_adapters::*, Key, Keyed, Topic, TopicKind,
+  };
 
   pub const TOPIC_KIND: TopicKind = TopicKind::WithKey;
 
@@ -728,6 +730,8 @@ impl Discovery {
       Ok(_) => (),
       _ => return, // Participant has probably crashed at this point
     };
+
+    println!("\nstarting discovery\n\n\n\n");
 
     loop {
       let mut events = Events::with_capacity(32); // Should this be outside of the loop?

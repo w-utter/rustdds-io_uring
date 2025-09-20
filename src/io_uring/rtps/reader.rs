@@ -4,19 +4,15 @@ use mio_06::Token;
 use log::{debug, error, info, trace, warn};
 use enumflags2::BitFlags;
 use speedy::{Endianness, Writable};
-use crate::io_uring::network::UDPSender;
-
-use crate::io_uring::encoding::user_data::ReadTimerVariant;
 
 use crate::{
   dds::{
     ddsdata::DDSData,
     qos::{policy, HasQoSPolicy, QosPolicies},
     statusevents::{CountWithChange, DataReaderStatus, DomainParticipantStatusEvent},
-    with_key::{
-      datawriter::{WriteOptions, WriteOptionsBuilder},
-    },
+    with_key::datawriter::{WriteOptions, WriteOptionsBuilder},
   },
+  io_uring::{encoding::user_data::ReadTimerVariant, network::UDPSender},
   messages::{
     header::Header,
     protocol_id::ProtocolId,
@@ -44,7 +40,6 @@ use crate::{
     time::Timestamp,
   },
 };
-
 #[cfg(feature = "security")]
 use super::Submessage;
 #[cfg(feature = "security")]
@@ -79,7 +74,7 @@ impl fmt::Debug for ReaderIngredients {
   }
 }
 
-use crate::io_uring::timer::{Timer, timer_state};
+use crate::io_uring::timer::{timer_state, Timer};
 
 pub struct Timers<S> {
   pub(crate) timed_event_timer: Option<Timer<(), S>>,
@@ -97,6 +92,7 @@ impl Timers<timer_state::Uninit> {
     ring: &mut io_uring::IoUring,
     entity_id: EntityId,
     domain_id: u16,
+    user: u8,
   ) -> std::io::Result<Timers<timer_state::Init>> {
     let Self { timed_event_timer } = self;
 
@@ -109,6 +105,7 @@ impl Timers<timer_state::Uninit> {
           ring,
           domain_id,
           user_data::Timer::Read(entity_id, user_data::ReadTimerVariant::RequestedDeadline),
+          user,
         )
       })
       .transpose()?;
@@ -203,6 +200,7 @@ impl Reader<timer_state::Uninit> {
     self,
     ring: &mut io_uring::IoUring,
     domain_id: u16,
+    user: u8,
   ) -> std::io::Result<Reader<timer_state::Init>> {
     let Self {
       like_stateless,
@@ -226,7 +224,7 @@ impl Reader<timer_state::Uninit> {
     } = self;
 
     let entity_id = self.my_guid.entity_id;
-    let timers = timers.register(ring, entity_id, domain_id)?;
+    let timers = timers.register(ring, entity_id, domain_id, user)?;
 
     Ok(Reader {
       like_stateless,
@@ -263,19 +261,14 @@ impl Reader<timer_state::Init> {
 
   pub fn set_requested_deadline_check_timer(&mut self) {
     if let Some(deadline) = self.qos_policy.deadline {
-      if let Some(t) = self.timers.timed_event_timer.as_mut() {
-        t.try_update_duration(deadline.0.into(), None);
+      if let Some(_) = self.timers.timed_event_timer.as_mut() {
+        //t.try_update_duration(deadline.0.into(), None);
       }
       debug!(
         "GUID={:?} set_requested_deadline_check_timer: {:?}",
         self.my_guid,
         deadline.0.to_std()
       );
-      /*
-      self
-        .timed_event_timer
-        .set_timeout(deadline.0.to_std(), TimedEvent::DeadlineMissedCheck);
-        */
     } else {
       trace!(
         "GUID={:?} - no deadline policy - do not set set_requested_deadline_check_timer",

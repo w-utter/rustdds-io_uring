@@ -546,6 +546,7 @@ impl MessageReceiver {
     target_reader_entity_id: EntityId,
     submessage: WriterSubmessage,
   ) {
+    println!("writer msg: {submessage:?}");
     if self.dest_guid_prefix != self.own_guid_prefix && self.dest_guid_prefix != GuidPrefix::UNKNOWN
     {
       debug!(
@@ -807,6 +808,7 @@ impl MessageReceiver {
   fn handle_reader_submessage(&self, submessage: ReaderSubmessage) {
     if self.dest_guid_prefix != self.own_guid_prefix && self.dest_guid_prefix != GuidPrefix::UNKNOWN
     {
+      println!("reader msg: {submessage:?}");
       debug!(
         "Message is not for this participant. Dropping. dest_guid_prefix={:?} participant \
          guid={:?}",
@@ -986,6 +988,7 @@ impl MessageReceiver {
   fn handle_interpreter_submessage(&mut self, interpreter_submessage: InterpreterSubmessage)
   // no return value, just change state of self.
   {
+    println!("interpreter msg: {interpreter_submessage:?}");
     match interpreter_submessage {
       InterpreterSubmessage::InfoTimestamp(ts_struct, _flags) => {
         // flags value was used already when parsing timestamp into an Option

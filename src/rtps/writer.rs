@@ -592,6 +592,7 @@ impl Writer {
                 None => None,                          // Sending to all matched readers
               };
 
+              println!("sending due to writer command");
               let send_also_heartbeat = true;
               self.send_cache_change(cc, send_also_heartbeat, target_reader_opt);
             } else {
@@ -677,6 +678,9 @@ impl Writer {
   ) -> bool {
     // First make sure that if the data is meant for a single reader only, we do not
     // accidentally send it to everyone
+
+    println!("sending cache change, readers: {:?}", self.readers);
+
     if let Some(single_reader_guid) = cc.write_options.to_single_reader() {
       match target_reader_opt {
         None => {
@@ -1041,7 +1045,11 @@ impl Writer {
           // yet. TODO: This
           // checks the stored unset_changes, not presently received ACKNACK.
           if cfg!(debug_assertions) {
-            if let Some(req_high) = reader_proxy.unsent_changes_iter().next_back() {
+            if let Some(req_high) = reader_proxy
+              .unsent_changes_iter()
+              .next_back()
+              .map(|i| i.end())
+            {
               if req_high > last_seq {
                 warn!(
                   "ReaderProxy {:?} thinks we need to send {:?} but I have only up to {:?}",
@@ -1508,6 +1516,14 @@ impl Writer {
     // TODO: In addition to Locators found in Readers, we should observe
     // the Locators given in MEssageReceiverState, i.e. if there was an
     // applicable InfoReply submessage, and we are sending a reply.
+    //println!("sending to writer: {:?}", self);
+
+    println!(
+      "sending {:?} from {:?} ({:?})",
+      message,
+      self.topic_name(),
+      self.guid()
+    );
 
     if self.my_guid.entity_id.entity_kind.is_user_defined() {
       println!("sending data on {:?}: {message:?}", self.my_guid.entity_id);
@@ -1593,6 +1609,7 @@ impl Writer {
     reader_proxy: &RtpsReaderProxy,
     requested_qos: &QosPolicies,
   ) {
+    println!("updating reader proxy");
     debug!("update_reader_proxy topic={:?}", self.my_topic_name);
     match self.qos_policies.compliance_failure_wrt(requested_qos) {
       // matched QoS
@@ -1653,6 +1670,7 @@ impl Writer {
   // return 0 if the reader already existed
   // return 1 if it was new ( = count of added reader proxies)
   fn matched_reader_update(&mut self, updated_reader_proxy: &RtpsReaderProxy) -> i32 {
+    println!("added reader proxy: {updated_reader_proxy:?}");
     let mut new = 0;
     let is_volatile = self.qos().is_volatile(); // Get this in advance to work with the borrow checker
     self

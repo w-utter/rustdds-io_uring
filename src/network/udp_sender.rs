@@ -109,6 +109,7 @@ impl UDPSender {
   }
 
   fn send_to_udp_socket(&self, buffer: &[u8], socket: &mio_08::net::UdpSocket, addr: &SocketAddr) {
+    println!("sending to {addr:?}");
     match socket.send_to(buffer, *addr) {
       Ok(bytes_sent) => {
         if bytes_sent == buffer.len() { // ok

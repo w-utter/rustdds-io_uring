@@ -3,7 +3,8 @@ mod discovery_db;
 pub(crate) mod traffic;
 
 pub use traffic::UdpListeners;
-pub use discovery::{Discovery2, Discovered};
-pub(crate) use discovery::MinimalHBData;
+pub use discovery::{Discovered, Discovery2};
 pub use discovery_db::DiscoveryDB;
-pub(crate) use discovery::{Cache, Caches, DiscoveredKind, BuiltinParticipantLost, ParticipantCleanup};
+pub(crate) use discovery::{
+  BuiltinParticipantLost, Cache, Caches, DiscoveredKind, ParticipantCleanup,
+};

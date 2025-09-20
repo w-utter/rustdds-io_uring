@@ -222,14 +222,16 @@ pub use dds::{
 /// CDR.
 pub use serialization::RepresentationIdentifier;
 #[doc(inline)]
-pub use serialization::{CDRDeserializerAdapter, CDRSerializerAdapter, CdrDeserializer, CdrSerializer};
+pub use serialization::{
+  CDRDeserializerAdapter, CDRSerializerAdapter, CdrDeserializer, CdrSerializer,
+};
 pub use structure::{
+  dds_cache::{DDSCache, TopicCache},
   duration::Duration,
   entity::RTPSEntity,
-  guid::{GUID, EntityId},
+  guid::{EntityId, GUID},
   sequence_number::SequenceNumber,
   time::Timestamp,
-  dds_cache::{DDSCache, TopicCache},
 };
 // re-export from a helper crate
 /// Helper trait to compute the CDR-serialized size of data

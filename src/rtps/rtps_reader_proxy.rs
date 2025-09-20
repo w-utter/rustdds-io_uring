@@ -50,7 +50,9 @@ pub(crate) struct RtpsReaderProxy {
   pub all_acked_before: SequenceNumber,
 
   // List of SequenceNumbers to be sent to Reader. Both unsent and requested by ACKNACK.
-  unsent_changes: BTreeSet<SequenceNumber>,
+  unsent_changes2: nodit::NoditSet<SequenceNumber, nodit::Interval<SequenceNumber>>,
+
+  //unsent_changes: BTreeSet<SequenceNumber>,
 
   // Messages that we are not going to send to this Reader.
   // We will send the SNs as GAP until they have been acked.
@@ -73,11 +75,12 @@ impl RtpsReaderProxy {
       expects_in_line_qos,
       is_active: true,
       all_acked_before: SequenceNumber::zero(),
-      unsent_changes: BTreeSet::new(),
+      //unsent_changes: BTreeSet::new(),
       pending_gap: BTreeSet::new(),
       repair_mode: false,
       qos,
       frags_requested: BTreeMap::new(),
+      unsent_changes2: nodit::NoditSet::new(),
     }
   }
 
@@ -125,28 +128,36 @@ impl RtpsReaderProxy {
 
   pub fn unsent_changes_iter(
     &self,
-  ) -> impl std::iter::DoubleEndedIterator<Item = SequenceNumber> + '_ {
-    self.unsent_changes.iter().cloned()
+  ) -> impl std::iter::DoubleEndedIterator<Item = nodit::Interval<SequenceNumber>> + '_ {
+    self.unsent_changes2.iter().cloned()
+    //self.unsent_changes.iter().cloned()
   }
 
   // used to produce log messages
-  pub fn unsent_changes_debug(&self) -> Vec<SequenceNumber> {
+  pub fn unsent_changes_debug(&self) -> Vec<nodit::Interval<SequenceNumber>> {
     self.unsent_changes_iter().collect()
   }
 
   pub fn first_unsent_change(&self) -> Option<SequenceNumber> {
-    self.unsent_changes_iter().next()
+    self.unsent_changes_iter().next().map(|i| i.start())
   }
 
   pub fn mark_change_sent(&mut self, seq_num: SequenceNumber) {
-    self.unsent_changes.remove(&seq_num);
+    let _ = self
+      .unsent_changes2
+      .cut(nodit::interval::ii(seq_num, seq_num));
+    //self.unsent_changes.remove(&seq_num);
   }
 
   // Changes are actually sent (via DATA/DATAFRAG) or reported missing as GAP
   pub fn remove_from_unsent_set_all_before(&mut self, before_seq_num: SequenceNumber) {
     // The handy split_off function "Returns everything after the given key,
     // including the key."
-    self.unsent_changes = self.unsent_changes.split_off(&before_seq_num);
+
+    let _ = self
+      .unsent_changes2
+      .cut(nodit::interval::ie(SequenceNumber::zero(), before_seq_num));
+    //self.unsent_changes = self.unsent_changes.split_off(&before_seq_num);
   }
 
   pub fn from_reader(reader: &ReaderIngredients, domain_participant: &DomainParticipant) -> Self {
@@ -166,11 +177,12 @@ impl RtpsReaderProxy {
       expects_in_line_qos: false,
       is_active: true,
       all_acked_before: SequenceNumber::zero(),
-      unsent_changes: BTreeSet::new(),
+      //unsent_changes: BTreeSet::new(),
       pending_gap: BTreeSet::new(),
       repair_mode: false,
       qos: reader.qos_policy.clone(),
       frags_requested: BTreeMap::new(),
+      unsent_changes2: nodit::NoditSet::new(),
     }
   }
 
@@ -188,11 +200,12 @@ impl RtpsReaderProxy {
       expects_in_line_qos: false,
       is_active: true,
       all_acked_before: SequenceNumber::zero(),
-      unsent_changes: BTreeSet::new(),
+      //unsent_changes: BTreeSet::new(),
       pending_gap: BTreeSet::new(),
       repair_mode: false,
       qos,
       frags_requested: BTreeMap::new(),
+      unsent_changes2: nodit::NoditSet::new(),
     }
   }
 
@@ -239,11 +252,12 @@ impl RtpsReaderProxy {
       expects_in_line_qos: discovered_reader_data.reader_proxy.expects_inline_qos,
       is_active: true,
       all_acked_before: SequenceNumber::zero(),
-      unsent_changes: BTreeSet::new(),
+      //unsent_changes: BTreeSet::new(),
       pending_gap: BTreeSet::new(),
       repair_mode: false,
       qos: discovered_reader_data.subscription_topic_data.qos(),
       frags_requested: BTreeMap::new(),
+      unsent_changes2: nodit::NoditSet::new(),
     }
   }
 
@@ -269,6 +283,9 @@ impl RtpsReaderProxy {
         // This is logged in `writer` object.
 
         // sanity check:
+
+        println!("\nsetting {self:?} to ack sn: {new_all_acked_before:?}\n");
+
         if new_all_acked_before < self.all_acked_before {
           error!(
             "all_acked_before updated backwards! old={:?} new={:?}",
@@ -280,20 +297,38 @@ impl RtpsReaderProxy {
 
         // Insert the requested changes. These are (by construction) greater
         // then new_all_acked_before.
+        let _ = self
+          .unsent_changes2
+          .insert_merge_touching_or_overlapping(nodit::interval::ii(
+            acknack.reader_sn_state.base(),
+            acknack.reader_sn_state.limit(),
+          ));
+        /*
         for nack_sn in acknack.reader_sn_state.iter() {
           self.unsent_changes.insert(nack_sn);
         }
+        */
         // sanity check
-        if let Some(&high) = self.unsent_changes.iter().next_back() {
+
+        let high = self.unsent_changes2.iter().next_back().map(|i| i.end());
+
+        if let Some(high) = high {
           if high > last_available {
             warn!(
               "ReaderProxy {:?} asks for {:?} but I have only up to {:?}. Truncating request. \
                ACKNACK = {:?}",
-              self.remote_reader_guid, self.unsent_changes, last_available, acknack
+              self.remote_reader_guid, self.unsent_changes2, last_available, acknack
             );
             // Requesting something which is not yet available is unreasonable.
             // Ignore the request from last_available + 1 onwards.
-            self.unsent_changes.split_off(&last_available.plus_1());
+
+            //self.unsent_changes.
+            let _ = self.unsent_changes2.cut(nodit::interval::ii(
+              last_available,
+              SequenceNumber::new(i64::MAX),
+            ));
+
+            //self.unsent_changes.split_off(&last_available.plus_1());
           }
         }
         // AckNack also clears pending_gap
@@ -332,7 +367,12 @@ impl RtpsReaderProxy {
         sequence_number, self.remote_reader_guid
       );
     }
-    self.unsent_changes.insert(sequence_number);
+
+    let _ = self
+      .unsent_changes2
+      .insert_merge_touching_or_overlapping(nodit::interval::ii(sequence_number, sequence_number));
+    //self.unsent_changes2.
+    //self.unsent_changes.insert(sequence_number);
   }
 
   pub fn acked_up_to_before(&self) -> SequenceNumber {

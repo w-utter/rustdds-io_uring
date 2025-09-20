@@ -1,7 +1,7 @@
-use std::net::UdpSocket;
-use std::net::{SocketAddr, IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 
 use io_uring_buf_ring::{buf_ring_state, BufRing};
+
 use crate::network;
 
 const MAX_MESSAGE_SIZE: usize = 64 * 1024; // This is max we can get from UDP.
@@ -24,11 +24,11 @@ impl<S> Drop for UDPListener<S> {
 
 use crate::io_uring::encoding;
 
-const BUFFER_ENTRIES: u16 = 16;
+const BUFFER_ENTRIES: u16 = 128;
 
 impl UDPListener<buf_ring_state::Uninit> {
   fn new_listening_socket(host: IpAddr, port: u16, reuse_addr: bool) -> std::io::Result<UdpSocket> {
-    use socket2::{Socket, Domain, Type, Protocol, SockAddr};
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
     let domain = match &host {
       IpAddr::V6(_) => Domain::IPV6,
@@ -104,6 +104,7 @@ impl UDPListener<buf_ring_state::Uninit> {
     buf_id: &mut u16,
     domain_id: u16,
     kind: encoding::user_data::UdpDataRecv,
+    user: u8,
   ) -> std::io::Result<UDPListener<buf_ring_state::Init>> {
     use core::ptr;
     // SAFETY: were never using `self` here again
@@ -127,28 +128,14 @@ impl UDPListener<buf_ring_state::Uninit> {
     let buf = unsafe { res.unwrap_unchecked() };
     let buf = buf.init();
 
-    use io_uring::{opcode, types::Fd};
-    use std::os::fd::AsRawFd;
-
-    let recv_multi = opcode::RecvMulti::new(Fd(socket.as_raw_fd()), buf.bgid())
-      .build()
-      .user_data(
-        encoding::UserData::new(domain_id, encoding::user_data::Variant::DataRecv(kind)).into(),
-      );
-
-    unsafe {
-      ring
-        .submission()
-        .push(&recv_multi)
-        .expect("submission queue full");
-    }
-    ring.submit()?;
-
-    Ok(UDPListener {
+    let listener = UDPListener {
       socket,
       buf,
       multicast_group,
-    })
+    };
+
+    listener.setup_recv_multi(domain_id, kind, user, ring)?;
+    Ok(listener)
   }
 }
 
@@ -188,6 +175,38 @@ impl UDPListener<buf_ring_state::Init> {
       network::util::get_local_unicast_locators(local_port)
     })
   }
+
+  pub(crate) fn setup_recv_multi(
+    &self,
+    domain_id: u16,
+    kind: encoding::user_data::UdpDataRecv,
+    user: u8,
+    ring: &mut io_uring::IoUring,
+  ) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    use io_uring::{opcode, types::Fd};
+
+    let recv_multi = opcode::RecvMulti::new(Fd(self.socket.as_raw_fd()), self.buf.bgid())
+      .build()
+      .user_data(
+        encoding::UserData::new(
+          domain_id,
+          encoding::user_data::Variant::DataRecv(kind),
+          user,
+        )
+        .into(),
+      );
+
+    unsafe {
+      ring
+        .submission()
+        .push(&recv_multi)
+        .expect("submission queue full");
+    }
+    ring.submit()?;
+    Ok(())
+  }
 }
 
 #[cfg(test)]
@@ -198,9 +217,7 @@ mod tests {
   use std::{thread, time};
 
   use super::*;
-  use crate::network::udp_sender::*;
-
-  use crate::io_uring::encoding::user_data::UdpDataRecv;
+  use crate::{io_uring::encoding::user_data::UdpDataRecv, network::udp_sender::*};
   const DUMMY_ID: UdpDataRecv = UdpDataRecv::MulticastDiscovery;
 
   #[test]

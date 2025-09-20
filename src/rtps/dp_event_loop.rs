@@ -258,6 +258,8 @@ impl DPEventLoop {
     let mut ev_wrapper = self;
     let mut preparing_to_stop = false;
 
+    println!("\nstarting\n\n\n\n");
+
     // loop starts here
     loop {
       ev_wrapper
@@ -629,6 +631,7 @@ impl DPEventLoop {
             qos.reliability = Some(policy::Reliability::BestEffort);
           };
 
+          println!("updating reader proxy due to participant");
           writer.update_reader_proxy(&reader_proxy, &qos);
           debug!(
             "update_discovery writer - endpoint {:?} - {:?}",

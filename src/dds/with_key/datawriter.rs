@@ -357,6 +357,7 @@ where
       send_buffer,
     ));
     let sequence_number = self.next_sequence_number();
+    println!("getting ready to send dds data: {ddsdata:?}");
     let writer_command = WriterCommand::DDSData {
       ddsdata,
       write_options,

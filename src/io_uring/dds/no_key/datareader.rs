@@ -5,19 +5,14 @@ use crate::{
     qos::{HasQoSPolicy, QosPolicies},
     readcondition::ReadCondition,
     result::ReadResult,
-    with_key::{
-      datasample::{DataSample as WithKeyDataSample},
-    },
+    with_key::datasample::DataSample as WithKeyDataSample,
   },
+  io_uring::dds::with_key::datareader as datareader_with_key,
+  no_key::wrappers::{DAWrapper, NoKeyWrapper},
   serialization::CDRDeserializerAdapter,
   structure::entity::RTPSEntity,
-  GUID,
+  TopicCache, GUID,
 };
-
-use crate::TopicCache;
-use crate::io_uring::dds::with_key::datareader as datareader_with_key;
-
-use crate::no_key::wrappers::{DAWrapper, NoKeyWrapper};
 
 /// Simplified type for CDR encoding
 pub type DataReaderCdr<D> = DataReader<D, CDRDeserializerAdapter<D>>;

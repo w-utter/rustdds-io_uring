@@ -310,8 +310,8 @@ impl TopicCache {
     )
   }
 
-  // TODO: make this iter better, make a fn that combines both so that the iterators dont have to
-  // be boxed.
+  // TODO: make this iter better, make a fn that combines both so that the
+  // iterators dont have to be boxed.
 
   pub fn get_changes_in_range_reliable<'a>(
     &'a self,

@@ -16,5 +16,4 @@ pub use message::{Message, MessageBuilder};
 
 pub(crate) mod submessage;
 pub use submessage::{Submessage, SubmessageBody};
-
 pub use message_receiver::MessageReceiver;

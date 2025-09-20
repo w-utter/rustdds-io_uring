@@ -1,9 +1,6 @@
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 
-use crate::with_key::datasample_cache::DataSampleCache;
-use crate::TopicCache;
-
 use crate::{
   dds::{
     adapters::with_key::{DefaultDecoder, *},
@@ -14,11 +11,12 @@ use crate::{
     with_key::datasample::*,
   },
   discovery::sedp_messages::PublicationBuiltinTopicData,
+  io_uring::dds::with_key::SimpleDataReader,
   serialization::CDRDeserializerAdapter,
   structure::{duration::Duration, entity::RTPSEntity, guid::GUID, time::Timestamp},
+  with_key::datasample_cache::DataSampleCache,
+  TopicCache,
 };
-
-use crate::io_uring::dds::with_key::SimpleDataReader;
 
 /// Simplified type for CDR encoding
 pub type DataReaderCdr<D> = DataReader<D, CDRDeserializerAdapter<D>>;

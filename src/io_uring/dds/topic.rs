@@ -1,11 +1,9 @@
 use std::{fmt::Debug, sync::Arc};
 
-use crate::{
-  dds::{
-    //participant::{DomainParticipant, DomainParticipantWeak},
-    qos::{HasQoSPolicy, QosPolicies},
-    typedesc::TypeDesc,
-  },
+use crate::dds::{
+  //participant::{DomainParticipant, DomainParticipantWeak},
+  qos::{HasQoSPolicy, QosPolicies},
+  typedesc::TypeDesc,
 };
 pub use crate::structure::topic_kind::TopicKind;
 

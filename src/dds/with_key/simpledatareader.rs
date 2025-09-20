@@ -48,9 +48,11 @@ pub(crate) enum ReaderCommand {
 // This is helper struct.
 // All mutable state needed for reading should go here.
 pub(crate) struct ReadState<K: Key> {
-  pub(crate) latest_instant: Timestamp, /* This is used as a read pointer from dds_cache for BEST_EFFORT
+  pub(crate) latest_instant: Timestamp, /* This is used as a read pointer from dds_cache for
+                                         * BEST_EFFORT
                                          * reading */
-  pub(crate) last_read_sn: BTreeMap<GUID, SequenceNumber>, // collection of read pointers for RELIABLE reading
+  pub(crate) last_read_sn: BTreeMap<GUID, SequenceNumber>, /* collection of read pointers for
+                                                            * RELIABLE reading */
   /// hash_to_key_map is used for decoding received key hashes back to original
   /// key values. This is needed when we receive a dispose message via hash
   /// only.

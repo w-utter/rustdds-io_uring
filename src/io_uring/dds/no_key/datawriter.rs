@@ -5,19 +5,18 @@ use crate::{
     adapters::no_key::SerializerAdapter,
     qos::{HasQoSPolicy, QosPolicies},
     result::{unwrap_no_key_write_error, WriteResult},
+    with_key::datawriter::WriteOptions,
   },
-  discovery::sedp_messages::SubscriptionBuiltinTopicData,
+  discovery::{discovery::DiscoveryCommand, sedp_messages::SubscriptionBuiltinTopicData},
+  io_uring::dds::{
+    with_key::{datawriter as datawriter_with_key, datawriter::DataSample},
+    Topic,
+  },
+  no_key::wrappers::{NoKeyWrapper, SAWrapper},
   serialization::CDRSerializerAdapter,
   structure::{entity::RTPSEntity, rpc::SampleIdentity, time::Timestamp},
   GUID,
 };
-
-use crate::io_uring::dds::Topic;
-use crate::no_key::wrappers::{NoKeyWrapper, SAWrapper};
-use crate::io_uring::dds::with_key::datawriter as datawriter_with_key;
-use crate::io_uring::dds::with_key::datawriter::DataSample;
-use crate::dds::with_key::datawriter::WriteOptions;
-use crate::discovery::discovery::DiscoveryCommand;
 
 /// Simplified type for CDR encoding
 pub type DataWriterCdr<D> = DataWriter<D, CDRSerializerAdapter<D>>;

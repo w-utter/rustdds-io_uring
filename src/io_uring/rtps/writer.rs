@@ -9,8 +9,6 @@ use std::{
 use log::{debug, error, info, trace, warn};
 use speedy::{Endianness, Writable};
 
-use crate::io_uring::timer::{Timer, timer_state};
-
 use crate::{
   dds::{
     ddsdata::DDSData,
@@ -22,11 +20,16 @@ use crate::{
     statusevents::{CountWithChange, DataWriterStatus, DomainParticipantStatusEvent},
     with_key::datawriter::WriteOptions,
   },
+  io_uring::{
+    encoding::user_data::WriteTimerVariant,
+    network::udp_sender::UDPSender,
+    timer::{timer_state, Timer},
+  },
   messages::submessages::submessages::AckSubmessage,
-  io_uring::network::udp_sender::UDPSender,
   rtps::{
     constant::{NACK_RESPONSE_DELAY, NACK_SUPPRESSION_DURATION},
     rtps_reader_proxy::RtpsReaderProxy,
+    writer::{DeliveryMode, HistoryBuffer},
     Message, MessageBuilder,
   },
   structure::{
@@ -46,9 +49,6 @@ use crate::{
 };
 #[cfg(not(feature = "security"))]
 use crate::no_security::SecurityPluginsHandle;
-
-use crate::rtps::writer::{DeliveryMode, HistoryBuffer};
-use crate::io_uring::encoding::user_data::WriteTimerVariant;
 
 pub enum WriterCommand {
   // TODO: try to make this more private, like pub(crate)
@@ -203,6 +203,7 @@ impl Timers<timer_state::Uninit> {
     ring: &mut io_uring::IoUring,
     domain_id: u16,
     entity_id: EntityId,
+    user: u8,
   ) -> std::io::Result<Timers<timer_state::Init>> {
     let Self {
       heartbeat,
@@ -220,6 +221,7 @@ impl Timers<timer_state::Uninit> {
           ring,
           domain_id,
           Timer::Write(entity_id, WriteTimerVariant::Heartbeat),
+          user,
         )
       })
       .transpose()?;
@@ -227,6 +229,7 @@ impl Timers<timer_state::Uninit> {
       ring,
       domain_id,
       Timer::Write(entity_id, WriteTimerVariant::CacheCleaning),
+      user,
     )?;
     let send_repair_data = send_repair_data
       .map(|timer| {
@@ -234,6 +237,7 @@ impl Timers<timer_state::Uninit> {
           ring,
           domain_id,
           Timer::Write(entity_id, WriteTimerVariant::SendRepairData),
+          user,
         )
       })
       .transpose()?;
@@ -243,6 +247,7 @@ impl Timers<timer_state::Uninit> {
           ring,
           domain_id,
           Timer::Write(entity_id, WriteTimerVariant::SendRepairFrags),
+          user,
         )
       })
       .transpose()?;
@@ -268,20 +273,23 @@ impl Timers<timer_state::Init> {
     nack_response_delay: Duration,
     domain_id: u16,
     ring: &mut io_uring::IoUring,
+    user: u8,
   ) {
     use crate::io_uring::encoding::user_data::{self, WriteTimerVariant};
 
-    let timer = Timer::new_immediate_oneshot(
-      remote_reader_guid,
-      nack_response_delay.into(),
-      None,
-      ring,
-      domain_id,
-      user_data::Timer::Write(writer_eid, WriteTimerVariant::SendRepairData),
-    )
-    .unwrap();
+    if self.send_repair_data.is_none() {
+      let timer = Timer::new_immediate_oneshot(
+        remote_reader_guid,
+        nack_response_delay.into(),
+        ring,
+        domain_id,
+        user_data::Timer::Write(writer_eid, WriteTimerVariant::SendRepairData),
+        user,
+      )
+      .unwrap();
 
-    self.send_repair_data = Some(timer);
+      self.send_repair_data = Some(timer);
+    }
   }
 }
 
@@ -352,6 +360,7 @@ impl Writer<timer_state::Uninit> {
     self,
     ring: &mut io_uring::IoUring,
     domain_id: u16,
+    user: u8,
   ) -> std::io::Result<Writer<timer_state::Init>> {
     let Self {
       endianness,
@@ -378,7 +387,7 @@ impl Writer<timer_state::Uninit> {
     } = self;
 
     let entity_id = my_guid.entity_id;
-    let timers = timers.register(ring, domain_id, entity_id)?;
+    let timers = timers.register(ring, domain_id, entity_id, user)?;
 
     Ok(Writer {
       endianness,
@@ -439,13 +448,15 @@ impl Writer<timer_state::Init> {
     ring: &mut io_uring::IoUring,
     timed_event: WriteTimerVariant,
     domain_id: u16,
+    user: u8,
   ) {
     match timed_event {
       WriteTimerVariant::Heartbeat => {
         //println!("explicit writer heartbeat");
         self.timers.heartbeat.as_mut().map(|hb| hb.reset());
         self.handle_heartbeat_tick(false, udp_sender, ring);
-        // ^^ false = This is automatic heartbeat by timer, not manual by application
+        // ^^ false = This is automatic heartbeat by timer, not manual by
+        // application
       }
       WriteTimerVariant::CacheCleaning => {
         self.timers.cache_cleaning.reset();
@@ -460,7 +471,7 @@ impl Writer<timer_state::Init> {
 
         let reader_guid = timer.take_inner();
 
-        self.handle_repair_data_send(reader_guid, udp_sender, ring, domain_id);
+        self.handle_repair_data_send(reader_guid, udp_sender, ring, domain_id, user);
         if let Some(rp) = self.lookup_reader_proxy_mut(reader_guid) {
           if rp.repair_mode {
             let delay_to_next_repair = self
@@ -475,6 +486,7 @@ impl Writer<timer_state::Init> {
               delay_to_next_repair.into(),
               domain_id,
               ring,
+              user,
             );
           }
         }
@@ -496,10 +508,10 @@ impl Writer<timer_state::Init> {
             let timer = Timer::new_immediate_oneshot(
               reader_guid,
               std::time::Duration::from(self.repairfrags_continue_delay),
-              None,
               ring,
               domain_id,
               user_data::Timer::Write(reader_guid.entity_id, WriteTimerVariant::SendRepairFrags),
+              user,
             )
             .unwrap();
 
@@ -629,7 +641,7 @@ impl Writer<timer_state::Init> {
         if self.like_stateless {
           error!(
             "Attempted to wait for acknowledgements in a stateless Writer, which currently only \
-               supports BestEffort QoS. Ignoring. topic={:?}",
+             supports BestEffort QoS. Ignoring. topic={:?}",
             self.my_topic_name
           );
           return Some(true);
@@ -677,6 +689,7 @@ impl Writer<timer_state::Init> {
   ) -> bool {
     // First make sure that if the data is meant for a single reader only, we do not
     // accidentally send it to everyone
+    println!("trying to send cache change");
     if let Some(single_reader_guid) = cc.write_options.to_single_reader() {
       match target_reader_opt {
         None => {
@@ -851,7 +864,7 @@ impl Writer<timer_state::Init> {
       match target_reader_opt {
         None => {
           // To all
-          println!("sending to {:?}", self.readers);
+          println!("sending {msg:?} to {:?}", self.readers);
           Self::send_message_to_readers(
             self.endianness,
             DeliveryMode::Multicast,
@@ -935,14 +948,17 @@ impl Writer<timer_state::Init> {
 
     /*
     println!("readers: {:?}", self.readers);
-    println!("changes: {first_change:?}...{last_change:?}");
     */
+    println!("changes: {first_change:?}...{last_change:?}");
 
-    if self
-      .readers
-      .values()
-      .all(|rp| last_change < rp.all_acked_before)
-    {
+    if self.readers.values().all(|rp| {
+      if last_change < rp.all_acked_before {
+        true
+      } else {
+        println!("\nchange not acked for: {rp:?}\n");
+        false
+      }
+    }) {
       println!("data is all available");
       trace!("heartbeat tick: all readers have all available data.");
     } else {
@@ -993,6 +1009,7 @@ impl Writer<timer_state::Init> {
     ring: &mut io_uring::IoUring,
     udp_sender: &UDPSender,
     domain_id: u16,
+    user: u8,
   ) {
     // sanity check
     if !self.is_reliable() || self.like_stateless {
@@ -1036,6 +1053,8 @@ impl Writer<timer_state::Init> {
         let my_topic = self.my_topic_name.clone(); // for debugging
         self.update_ack_waiters(reader_guid, Some(an.reader_sn_state.base()));
 
+        println!("acknack has guid: {reader_guid:?}");
+
         if let Some(reader_proxy) = self.lookup_reader_proxy_mut(reader_guid) {
           // Mark requested SNs as "unsent changes"
 
@@ -1048,7 +1067,11 @@ impl Writer<timer_state::Init> {
           // yet. TODO: This
           // checks the stored unset_changes, not presently received ACKNACK.
           if cfg!(debug_assertions) {
-            if let Some(req_high) = reader_proxy.unsent_changes_iter().next_back() {
+            if let Some(req_high) = reader_proxy
+              .unsent_changes_iter()
+              .next_back()
+              .map(|i| i.end())
+            {
               if req_high > last_seq {
                 warn!(
                   "ReaderProxy {:?} thinks we need to send {:?} but I have only up to {:?}",
@@ -1080,22 +1103,28 @@ impl Writer<timer_state::Init> {
 
           // if we cannot send more data, we are done.
           // This is to prevent empty "repair data" messages from being sent.
+
+          println!("{:?} > {last_seq:?}", reader_proxy.all_acked_before);
+
           if reader_proxy.all_acked_before > last_seq {
             reader_proxy.repair_mode = false;
           } else {
             reader_proxy.repair_mode = true; // TODO: Is this correct? Do we need to repair immediately?
                                              // set repair timer to fire
-
             self.timers.set_send_repair_data(
               self.my_guid.entity_id,
               reader_guid,
               self.nack_response_delay.into(),
               domain_id,
               ring,
+              user,
             );
           }
-        } // if have reader_proxy
-
+        }
+        // if have reader_proxy
+        else {
+          println!("\n\nno reader proxy available\n\n");
+        }
         // See if we need to respond by GAP message
         if let Some(reader_proxy) = self.readers.get(&reader_guid) {
           if !reader_proxy.get_pending_gap().is_empty() {
@@ -1131,10 +1160,10 @@ impl Writer<timer_state::Init> {
         let timer = Timer::new_immediate_oneshot(
           reader_guid,
           self.nackfrag_response_delay,
-          None,
           ring,
           domain_id,
           user_data::Timer::Write(reader_guid.entity_id, WriteTimerVariant::SendRepairFrags),
+          user,
         )
         .unwrap();
 
@@ -1161,6 +1190,7 @@ impl Writer<timer_state::Init> {
     udp_sender: &UDPSender,
     ring: &mut io_uring::IoUring,
     domain_id: u16,
+    user: u8,
   ) {
     if self.like_stateless {
       warn!(
@@ -1177,7 +1207,7 @@ impl Writer<timer_state::Init> {
       // We use a worker function to ensure that afterwards we can insert the
       // reader_proxy back. This technique ensures that all return paths lead to
       // re-insertion.
-      self.handle_repair_data_send_worker(&mut reader_proxy, udp_sender, ring, domain_id);
+      self.handle_repair_data_send_worker(&mut reader_proxy, udp_sender, ring, domain_id, user);
       // insert reader back
       if let Some(rp) = self
         .readers
@@ -1223,6 +1253,7 @@ impl Writer<timer_state::Init> {
     udp_sender: &UDPSender,
     ring: &mut io_uring::IoUring,
     domain_id: u16,
+    user: u8,
   ) {
     // Note: The reader_proxy is now removed from readers map
     let reader_guid = reader_proxy.remote_reader_guid;
@@ -1282,10 +1313,10 @@ impl Writer<timer_state::Init> {
             let timer = Timer::new_immediate_oneshot(
               reader_guid,
               self.repairfrags_continue_delay,
-              None,
               ring,
               domain_id,
               user_data::Timer::Write(reader_guid.entity_id, WriteTimerVariant::SendRepairFrags),
+              user,
             )
             .unwrap();
             self.timers.set_send_repair_frags(timer);
@@ -1545,6 +1576,7 @@ impl Writer<timer_state::Init> {
     udp_sender: &UDPSender,
     ring: &mut io_uring::IoUring,
   ) {
+    println!("sending {message:?}");
     // TODO: This is a stupid transmit algorithm. We should compute a preferred
     // unicast and multicast locators for each reader only on every reader update,
     // and not find it dynamically on every message.
@@ -1562,6 +1594,8 @@ impl Writer<timer_state::Init> {
       Ok(message) => {
         let buffer = message.write_to_vec_with_ctx(endianness).unwrap();
         let mut already_sent_to = BTreeSet::new();
+
+        println!("planning to send");
 
         macro_rules! send_unless_sent_and_mark {
           ($locs:expr) => {
@@ -1800,26 +1834,7 @@ impl Writer<timer_state::Init> {
   // pub fn reset_offered_deadline_missed_status(&mut self) {
   //   self.offered_deadline_status.reset_change();
   // }
-
-  fn minimal_hb_data(&self) -> MinimalHBData<'_> {
-      let heartbeat_count = self.next_heartbeat_count();
-      let Self {
-          history_buffer,
-          readers,
-          my_guid,
-          ..
-      } = self;
-
-      MinimalHBData {
-          history_buffer,
-          reader_proxies: readers,
-          writer_guid: *my_guid,
-          heartbeat_count,
-      }
-  }
 }
-
-use crate::io_uring::discovery::MinimalHBData;
 
 pub struct LostReaders<'a> {
   writer: &'a mut Writer<timer_state::Init>,

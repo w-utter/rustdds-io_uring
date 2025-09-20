@@ -1,21 +1,18 @@
-use crate::{QosPolicies, TopicKind, TypeDesc};
-use crate::io_uring::dds::topic::Topic;
-use crate::io_uring::dds::cache::DDSCache;
-use crate::io_uring::discovery::DiscoveryDB;
-use crate::io_uring::network::UDPSender;
-use crate::io_uring::dds::{with_key, no_key};
-use crate::dds::CreateResult;
-
-use crate::GUID;
-use crate::structure::guid::EntityKind;
-use crate::EntityId;
-
-use crate::io_uring::rtps::Domain;
-use crate::io_uring::timer::timer_state;
 use io_uring_buf_ring::buf_ring_state;
 use io_uring::IoUring;
 
-use crate::io_uring::discovery::Discovery2;
+use crate::{
+  dds::CreateResult,
+  io_uring::{
+    dds::{cache::DDSCache, no_key, topic::Topic, with_key},
+    discovery::{Discovery2, DiscoveryDB},
+    network::UDPSender,
+    rtps::Domain,
+    timer::timer_state,
+  },
+  structure::guid::EntityKind,
+  EntityId, QosPolicies, TopicKind, TypeDesc, GUID,
+};
 
 pub struct Participant {
   pub guid: GUID,
@@ -90,8 +87,7 @@ pub struct Publisher<'a, 'q> {
   qos: &'q QosPolicies,
 }
 
-use crate::with_key::SerializerAdapter;
-use crate::Keyed;
+use crate::{with_key::SerializerAdapter, Keyed};
 
 impl Publisher<'_, '_> {
   pub fn create_datawriter_cdr<D: Keyed + serde::Serialize>(
@@ -102,11 +98,12 @@ impl Publisher<'_, '_> {
     ring: &mut IoUring,
     discovery: &mut Discovery2<timer_state::Init>,
     udp_sender: &UDPSender,
+    user: u8,
   ) -> with_key::DataWriterCdr<D>
   where
     <D as Keyed>::K: serde::Serialize,
   {
-    self.create_datawriter(qos, discovery_db, domain, ring, discovery, udp_sender)
+    self.create_datawriter(qos, discovery_db, domain, ring, discovery, udp_sender, user)
   }
   pub fn create_datawriter<D: Keyed, SA: SerializerAdapter<D>>(
     &mut self,
@@ -116,9 +113,10 @@ impl Publisher<'_, '_> {
     ring: &mut IoUring,
     discovery: &mut Discovery2<timer_state::Init>,
     udp_sender: &UDPSender,
+    user: u8,
   ) -> with_key::DataWriter<D, SA> {
-    //1) pubsub line 160
-    //2) pubsub line 446
+    // 1) pubsub line 160
+    // 2) pubsub line 446
     use crate::dds::qos::HasQoSPolicy;
     let writer_qos = self
       .qos
@@ -166,7 +164,7 @@ impl Publisher<'_, '_> {
     };
 
     domain
-      .add_local_writer(writer_ing, udp_sender, ring)
+      .add_local_writer(writer_ing, udp_sender, ring, discovery.initialized(), user)
       .unwrap();
 
     discovery.publish_writer(guid, discovery_db, udp_sender, ring);
@@ -188,8 +186,10 @@ impl Publisher<'_, '_> {
     ring: &mut IoUring,
     discovery: &mut Discovery2<timer_state::Init>,
     udp_sender: &UDPSender,
+    user: u8,
   ) -> no_key::DataWriter<D, SA> {
-    let writer = self.create_datawriter(qos, discovery_db, domain, ring, discovery, udp_sender);
+    let writer =
+      self.create_datawriter(qos, discovery_db, domain, ring, discovery, udp_sender, user);
     no_key::DataWriter::from_keyed(writer)
   }
 
@@ -201,11 +201,12 @@ impl Publisher<'_, '_> {
     ring: &mut IoUring,
     discovery: &mut Discovery2<timer_state::Init>,
     udp_sender: &UDPSender,
+    user: u8,
   ) -> no_key::DataWriterCdr<D>
   where
     <D as Keyed>::K: serde::Serialize,
   {
-    self.create_datawriter_no_key(qos, discovery_db, domain, ring, discovery, udp_sender)
+    self.create_datawriter_no_key(qos, discovery_db, domain, ring, discovery, udp_sender, user)
   }
 }
 
@@ -215,8 +216,7 @@ pub struct Subscriber<'a, 'q> {
   qos: &'q QosPolicies,
 }
 
-use crate::with_key::DeserializerAdapter;
-use crate::io_uring::dds::with_key::SimpleDataReader;
+use crate::{io_uring::dds::with_key::SimpleDataReader, with_key::DeserializerAdapter};
 impl Subscriber<'_, '_> {
   pub fn create_datareader_cdr<D: Keyed + serde::de::DeserializeOwned + 'static>(
     &mut self,
@@ -227,6 +227,7 @@ impl Subscriber<'_, '_> {
     ring: &mut IoUring,
     discovery: &mut Discovery2<timer_state::Init>,
     udp_sender: &UDPSender,
+    user: u8,
   ) -> CreateResult<with_key::DataReaderCdr<D>>
   where
     <D as Keyed>::K: serde::de::DeserializeOwned,
@@ -239,6 +240,7 @@ impl Subscriber<'_, '_> {
       ring,
       discovery,
       udp_sender,
+      user,
     )
   }
 
@@ -251,6 +253,7 @@ impl Subscriber<'_, '_> {
     ring: &mut IoUring,
     discovery: &mut Discovery2<timer_state::Init>,
     udp_sender: &UDPSender,
+    user: u8,
   ) -> CreateResult<with_key::DataReader<D, SA>> {
     let simple = self.create_simple_datareader(
       qos,
@@ -260,6 +263,7 @@ impl Subscriber<'_, '_> {
       ring,
       discovery,
       udp_sender,
+      user,
     )?;
 
     Ok(with_key::DataReader::from_simple_data_reader(simple))
@@ -274,6 +278,7 @@ impl Subscriber<'_, '_> {
     ring: &mut IoUring,
     discovery: &mut Discovery2<timer_state::Init>,
     udp_sender: &UDPSender,
+    user: u8,
   ) -> CreateResult<SimpleDataReader<D, SA>> {
     // pubsub line 786
     // pubsub line 1216
@@ -335,8 +340,7 @@ impl Subscriber<'_, '_> {
 
     let content_filter = None;
 
-    use crate::discovery::ReaderProxy;
-    use crate::discovery::DiscoveredReaderData;
+    use crate::discovery::{DiscoveredReaderData, ReaderProxy};
     let discovered_data = DiscoveredReaderData {
       reader_proxy: ReaderProxy::from(proxy),
       subscription_topic_data: subscription_data,
@@ -345,7 +349,7 @@ impl Subscriber<'_, '_> {
     discovery_db.update_local_topic_reader(discovered_data);
     discovery_db.update_topic_data_p(self.topic);
 
-    domain.add_local_reader(reader_ing, ring).unwrap();
+    domain.add_local_reader(reader_ing, ring, user).unwrap();
 
     discovery.publish_reader(guid, discovery_db, udp_sender, ring);
     discovery.publish_topic(&self.topic.name(), discovery_db, udp_sender, ring);
@@ -362,6 +366,7 @@ impl Subscriber<'_, '_> {
     ring: &mut IoUring,
     discovery: &mut Discovery2<timer_state::Init>,
     udp_sender: &UDPSender,
+    user: u8,
   ) -> CreateResult<no_key::DataReader<D, SA>> {
     let reader = self.create_datareader(
       qos,
@@ -371,6 +376,7 @@ impl Subscriber<'_, '_> {
       ring,
       discovery,
       udp_sender,
+      user,
     )?;
 
     Ok(no_key::DataReader::from_keyed(reader))
@@ -385,6 +391,7 @@ impl Subscriber<'_, '_> {
     ring: &mut IoUring,
     discovery: &mut Discovery2<timer_state::Init>,
     udp_sender: &UDPSender,
+    user: u8,
   ) -> CreateResult<no_key::DataReaderCdr<D>>
   where
     <D as Keyed>::K: serde::de::DeserializeOwned,
@@ -397,6 +404,7 @@ impl Subscriber<'_, '_> {
       ring,
       discovery,
       udp_sender,
+      user,
     )
   }
 }

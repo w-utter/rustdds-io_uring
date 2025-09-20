@@ -1,29 +1,27 @@
 use std::{collections::BTreeMap, time::Instant};
 
-use crate::rtps::rtps_reader_proxy::RtpsReaderProxy;
-
 use chrono::Utc;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 
-use crate::io_uring::dds::topic::{Topic, TopicDescription};
 use crate::{
   dds::{
     qos::HasQoSPolicy,
     statusevents::{DomainParticipantStatusEvent, LostReason},
   },
-  rtps::{rtps_writer_proxy::RtpsWriterProxy},
+  discovery::{
+    sedp_messages::{
+      topics_inconsistent, DiscoveredReaderData, DiscoveredTopicData, DiscoveredWriterData,
+      ParticipantMessageData, ReaderProxy, TopicBuiltinTopicData, WriterProxy,
+    },
+    spdp_participant_data::SpdpDiscoveredParticipantData,
+  },
+  io_uring::dds::topic::{Topic, TopicDescription},
+  rtps::{rtps_reader_proxy::RtpsReaderProxy, rtps_writer_proxy::RtpsWriterProxy},
   structure::{
     duration::Duration,
     guid::{EntityId, GuidPrefix, GUID},
   },
-};
-use crate::discovery::{
-  sedp_messages::{
-    topics_inconsistent, DiscoveredReaderData, DiscoveredTopicData, DiscoveredWriterData,
-    ParticipantMessageData, ReaderProxy, TopicBuiltinTopicData, WriterProxy,
-  },
-  spdp_participant_data::SpdpDiscoveredParticipantData,
 };
 #[cfg(feature = "security")]
 use crate::discovery::secure_discovery::AuthenticationStatus;
@@ -573,7 +571,8 @@ impl DiscoveryDB {
         }
         // We have to topic, but not from this participant
         // TODO: Check that there is agreement about topic type name (at least)
-        t.insert(updater, (discovered_via, dtd.clone())); // this should return None
+        t.insert(updater, (discovered_via, dtd.clone())); // this should return
+                                                          // None
       }
     } else {
       // new topic to us

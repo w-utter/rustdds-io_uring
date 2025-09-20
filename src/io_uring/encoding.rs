@@ -2,11 +2,17 @@
 pub struct UserData {
   domain_id: u16,
   variant: user_data::Variant,
+  // extra 11 bits of data
+  user: u8,
 }
 
 impl UserData {
-  pub fn new(domain_id: u16, variant: user_data::Variant) -> Self {
-    Self { domain_id, variant }
+  pub fn new(domain_id: u16, variant: user_data::Variant, user: u8) -> Self {
+    Self {
+      domain_id,
+      variant,
+      user,
+    }
   }
 
   pub fn domain_id(&self) -> u16 {
@@ -20,7 +26,11 @@ impl UserData {
 
 impl From<UserData> for u64 {
   fn from(udata: UserData) -> u64 {
-    let UserData { domain_id, variant } = udata;
+    let UserData {
+      domain_id,
+      variant,
+      user,
+    } = udata;
 
     let domain_id = domain_id as u64;
 
@@ -76,9 +86,11 @@ impl From<UserData> for u64 {
       }
     };
     let rest = variant | (rest << 3);
-    domain_id | (rest << 16)
+    domain_id | (rest << 16) | ((user as u64) << USER_OFFSET)
   }
 }
+
+pub const USER_OFFSET: u64 = 64 - 8;
 
 impl TryFrom<u64> for UserData {
   type Error = ();
@@ -86,6 +98,7 @@ impl TryFrom<u64> for UserData {
   fn try_from(raw: u64) -> Result<UserData, Self::Error> {
     let domain_id = (raw & 0xFFFF) as u16;
 
+    let user = (raw >> USER_OFFSET) as u8;
     let raw = raw >> 16;
     let raw_variant = raw & 0b111;
     let raw = raw >> 3;
@@ -150,7 +163,11 @@ impl TryFrom<u64> for UserData {
       _ => return Err(()),
     };
 
-    Ok(UserData { variant, domain_id })
+    Ok(UserData {
+      variant,
+      domain_id,
+      user,
+    })
   }
 }
 
@@ -207,8 +224,9 @@ pub mod user_data {
 #[cfg(test)]
 mod tests {
   // TODO: test this, then impl in the register fns.
-  use super::*;
   use user_data::*;
+
+  use super::*;
   use crate::structure::guid::EntityId;
 
   macro_rules! mirror_udata {

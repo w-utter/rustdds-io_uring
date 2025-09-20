@@ -1,7 +1,12 @@
-use crate::io_uring::timer::{timer_state, Timer};
 use std::collections::BTreeMap;
-use crate::io_uring::dds::DDSCache;
-use crate::TopicCache;
+
+use crate::{
+  io_uring::{
+    dds::DDSCache,
+    timer::{timer_state, Timer},
+  },
+  TopicCache,
+};
 
 struct Timers<T> {
   acknack: Timer<(), T>,
@@ -20,28 +25,30 @@ impl Timers<timer_state::Uninit> {
     self,
     ring: &mut io_uring::IoUring,
     domain_id: u16,
+    user: u8,
   ) -> std::io::Result<Timers<timer_state::Init>> {
     let Self { acknack, cache_gc } = self;
 
-    use crate::io_uring::encoding::user_data::{Timer, BuiltinTimerVariant};
+    use crate::io_uring::encoding::user_data::{BuiltinTimerVariant, Timer};
 
     let acknack = acknack.register(
       ring,
       domain_id,
       Timer::Builtin(BuiltinTimerVariant::AckNack),
+      user,
     )?;
     let cache_gc = cache_gc.register(
       ring,
       domain_id,
       Timer::Builtin(BuiltinTimerVariant::CacheCleaning),
+      user,
     )?;
 
     Ok(Timers { acknack, cache_gc })
   }
 }
 
-use crate::io_uring::discovery::traffic::UdpListeners;
-use crate::io_uring::discovery::{Discovery2, DiscoveryDB};
+use crate::io_uring::discovery::{traffic::UdpListeners, Discovery2, DiscoveryDB};
 
 pub struct Domain<TS, BS> {
   pub(crate) domain_info: DomainInfo,
@@ -109,6 +116,7 @@ impl Domain<timer_state::Uninit, buf_ring_state::Uninit> {
     self,
     ring: &mut io_uring::IoUring,
     id: &mut u16,
+    user: u8,
   ) -> std::io::Result<Domain<timer_state::Init, buf_ring_state::Init>> {
     let Self {
       domain_info,
@@ -126,11 +134,11 @@ impl Domain<timer_state::Uninit, buf_ring_state::Uninit> {
 
     let writers = writers
       .into_iter()
-      .map(|(id, w)| Ok((id, w.register(ring, domain_info.domain_id)?)))
+      .map(|(id, w)| Ok((id, w.register(ring, domain_info.domain_id, user)?)))
       .collect::<Result<_, std::io::Error>>()?;
 
-    let listeners = listeners.register(ring, id, domain_info.domain_id)?;
-    let timers = timers.register(ring, domain_info.domain_id)?;
+    let listeners = listeners.register(ring, id, domain_info.domain_id, user)?;
+    let timers = timers.register(ring, domain_info.domain_id, user)?;
 
     Ok(Domain {
       domain_info,
@@ -155,22 +163,45 @@ use crate::io_uring::rtps::PassedSubmessage;
 impl Domain<timer_state::Init, buf_ring_state::Init> {
   pub fn handle_event(
     &mut self,
+    entry: io_uring::cqueue::Entry,
     ring: &mut io_uring::IoUring,
     discovery: &mut Discovery2<timer_state::Init>,
     discovery_db: &mut DiscoveryDB,
     udp_sender: &UDPSender,
     dds_cache: &mut DDSCache,
-    mut on_data_status: impl FnMut(DataStatus, GUID),
-    mut on_participant_status: impl FnMut(DomainParticipantStatusEvent),
-    mut on_read: impl FnMut(&str, &mut TopicCache),
+    mut on_data_status: impl for<'a> FnMut(DataStatus, GUID, DomainRef<'a, 'a>),
+    mut on_participant_status: impl for<'a> FnMut(DomainParticipantStatusEvent, DomainRef<'a, 'a>),
+    mut on_read: impl for<'a> FnMut(&str, &mut TopicCache, DomainRef<'a, 'a>),
+    user: u8,
   ) -> Option<()> {
-    use crate::io_uring::encoding::{UserData, user_data::*};
-    let entry = ring.completion().next()?;
-    let userdata = UserData::try_from(entry.user_data()).ok()?;
+    use crate::io_uring::encoding::{user_data::*, UserData};
+
+    let res = entry.result();
+
+    let userdata = UserData::try_from(entry.user_data()).ok();
+
+    if res < 0 {
+      println!("{}: {:?}", entry.result(), userdata);
+    }
+
+    let userdata = userdata?;
 
     match userdata.variant() {
       Variant::DataRecv(udp_variant) => {
-        let buf_id = self.listeners.buffer_from_cqe(udp_variant, &entry).ok()??;
+        let buf_id = self.listeners.buffer_from_cqe(udp_variant, &entry);
+        let buf_id = match buf_id {
+          Err(ref e) => {
+            let kind = e.raw_os_error();
+            drop(buf_id);
+            self
+              .listeners
+              .try_fix_err(kind, udp_variant, self.domain_info.domain_id, user, ring)
+              .ok()?;
+            return Some(());
+          }
+          Ok(o) => o?,
+        };
+
         let buffer = buf_id.buffer();
         let bytes = bytes::Bytes::copy_from_slice(buffer);
 
@@ -178,6 +209,11 @@ impl Domain<timer_state::Init, buf_ring_state::Init> {
         drop(buf_id);
 
         let mut submsgs = self.message_receiver.handle_received_packet_2(&bytes)?;
+        /*
+        for submsg in submsgs {
+            println!("{submsg:?}");
+        }
+        */
 
         // let f = |hb| hb.send_initial_cache_change(udp_sender, ring);
         // move this (&F: Fn(HbMsg) -> ()) to the
@@ -187,6 +223,7 @@ impl Domain<timer_state::Init, buf_ring_state::Init> {
 
           match submsg {
             PassedSubmessage::Writer(msg) => {
+              //println!("writer msg: {msg:?}");
               match discovery.handle_writer_msg(msg, &state, discovery_db, udp_sender, ring) {
                 // builtin
                 Ok(Some(mut changes)) => {
@@ -194,22 +231,35 @@ impl Domain<timer_state::Init, buf_ring_state::Init> {
 
                   let readers = &mut msg_recv.available_readers;
 
-                  //let caches: &mut Caches<timer_state::Init> = unsafe {&mut*(&mut discovery.caches as *mut _)};
+                  //let caches: &mut Caches<timer_state::Init> = unsafe {&mut*(&mut
+                  // discovery.caches as *mut _)};
 
-                  iterate_events(discovery, discovery_db, readers, &mut self.writers, &mut changes, ring, udp_sender, |ev| match ev {
-                      DomainStatusEvent::Participant(p) => on_participant_status(p),
+                  iterate_events(
+                    discovery,
+                    discovery_db,
+                    readers,
+                    &mut self.writers,
+                    &mut changes,
+                    ring,
+                    udp_sender,
+                    |ev, dref| match ev {
+                      DomainStatusEvent::Participant(p) => on_participant_status(p, dref),
                       DomainStatusEvent::Data(d, guid) => {
-                          if guid.entity_id.entity_kind.is_user_defined() {
-                              on_data_status(d, guid);
-                          }
-                      },
-                      DomainStatusEvent::Mixed(p, (d, guid)) => {
-                          on_participant_status(p);
-                          if guid.entity_id.entity_kind.is_user_defined() {
-                              on_data_status(d, guid);
-                          }
+                        if guid.entity_id.entity_kind.is_user_defined() {
+                          on_data_status(d, guid, dref);
+                        }
                       }
-                  });
+                      DomainStatusEvent::Mixed(p, (d, guid)) => {
+                        let dref2 =
+                          DomainRef::new(dref.writers, dref.ring, dref.discovery, dref.udp_sender);
+
+                        on_participant_status(p, dref2);
+                        if guid.entity_id.entity_kind.is_user_defined() {
+                          on_data_status(d, guid, dref);
+                        }
+                      }
+                    },
+                  );
                 }
                 Ok(None) => return None,
                 //not a builtin.
@@ -242,7 +292,11 @@ impl Domain<timer_state::Init, buf_ring_state::Init> {
                           continue;
                         }
                         let topic = &reader.topic_name;
-                        on_read(topic, topic_cache);
+                        on_read(
+                          topic,
+                          topic_cache,
+                          DomainRef::new(&mut self.writers, ring, discovery, udp_sender),
+                        );
                       }
                       WriterSubmessage::Heartbeat(heartbeat, flags) => {
                         use crate::messages::submessages::submessages::HEARTBEAT_Flags;
@@ -275,13 +329,40 @@ impl Domain<timer_state::Init, buf_ring_state::Init> {
               }
             }
             PassedSubmessage::Reader(m, source_guid_prefix) => {
-              match discovery.handle_reader_submsg(m, source_guid_prefix, ring) {
+              //println!("reader msg: {m:?}");
+              match discovery.handle_reader_submsg(m, source_guid_prefix, ring, user) {
                 // builtin
-                Ok(_) => (),
+                Ok(_) => {
+                  //println!("builtin reader");
+                }
                 // not a builtin
-                Err(msg) => {
-                  //println!("reader: {m:?}, {source_guid_prefix:?}");
-                  println!("missed reader: {msg:?}");
+                Err((msg, prefix)) => {
+                  use crate::messages::submessages::submessage::HasEntityIds;
+                  let writer_entity_id = msg.receiver_entity_id();
+
+                  if let Some(writer) = self.writers.get_mut(&writer_entity_id) {
+                    use crate::messages::submessages::submessages::{
+                      AckSubmessage, ReaderSubmessage,
+                    };
+                    let ack_submsg = match msg {
+                      ReaderSubmessage::AckNack(acknack, _) => AckSubmessage::AckNack(acknack),
+                      ReaderSubmessage::NackFrag(nack_frag, _) => {
+                        AckSubmessage::NackFrag(nack_frag)
+                      }
+                    };
+
+                    writer.handle_ack_nack(
+                      prefix,
+                      &ack_submsg,
+                      ring,
+                      udp_sender,
+                      self.domain_info.domain_id,
+                      user,
+                    );
+                  } else {
+                    //println!("missed reader: {msg:?} with id
+                    // {writer_entity_id:?}");
+                  }
                 }
               }
             }
@@ -322,20 +403,54 @@ impl Domain<timer_state::Init, buf_ring_state::Init> {
             );
 
             while let Some(lost_participant) = lost_cleanup.next() {
-                match lost_participant {
-                      DomainStatusEvent::Participant(p) => on_participant_status(p),
-                      DomainStatusEvent::Data(d, guid) => {
-                          if guid.entity_id.entity_kind.is_user_defined() {
-                              on_data_status(d, guid);
-                          }
-                      },
-                      DomainStatusEvent::Mixed(p, (d, guid)) => {
-                          on_participant_status(p);
-                          if guid.entity_id.entity_kind.is_user_defined() {
-                              on_data_status(d, guid);
-                          }
-                      }
+              match lost_participant {
+                DomainStatusEvent::Participant(p) => on_participant_status(
+                  p,
+                  DomainRef::new(
+                    &mut lost_cleanup.writers,
+                    ring,
+                    lost_cleanup.discovery,
+                    udp_sender,
+                  ),
+                ),
+                DomainStatusEvent::Data(d, guid) => {
+                  if guid.entity_id.entity_kind.is_user_defined() {
+                    on_data_status(
+                      d,
+                      guid,
+                      DomainRef::new(
+                        lost_cleanup.writers,
+                        ring,
+                        lost_cleanup.discovery,
+                        udp_sender,
+                      ),
+                    );
+                  }
                 }
+                DomainStatusEvent::Mixed(p, (d, guid)) => {
+                  on_participant_status(
+                    p,
+                    DomainRef::new(
+                      lost_cleanup.writers,
+                      ring,
+                      lost_cleanup.discovery,
+                      udp_sender,
+                    ),
+                  );
+                  if guid.entity_id.entity_kind.is_user_defined() {
+                    on_data_status(
+                      d,
+                      guid,
+                      DomainRef::new(
+                        lost_cleanup.writers,
+                        ring,
+                        lost_cleanup.discovery,
+                        udp_sender,
+                      ),
+                    );
+                  }
+                }
+              }
             }
           }
           BuiltinTimerVariant::TopicCleaning => {
@@ -364,7 +479,13 @@ impl Domain<timer_state::Init, buf_ring_state::Init> {
               match t {
                 Timer::Write(entity_id, kind) => {
                   if let Some(writer) = self.writers.get_mut(&entity_id) {
-                    writer.handle_timed_event(udp_sender, ring, kind, self.domain_info.domain_id);
+                    writer.handle_timed_event(
+                      udp_sender,
+                      ring,
+                      kind,
+                      self.domain_info.domain_id,
+                      user,
+                    );
                   }
                 }
                 Timer::Read(entity_id, kind) => {
@@ -387,10 +508,11 @@ impl Domain<timer_state::Init, buf_ring_state::Init> {
     &mut self,
     reader_ing: ReaderIngredients,
     ring: &mut io_uring::IoUring,
+    user: u8,
   ) -> std::io::Result<()> {
     let domain_id = self.domain_info.domain_id;
 
-    let new_reader = Reader::new(reader_ing).register(ring, domain_id)?;
+    let new_reader = Reader::new(reader_ing).register(ring, domain_id, user)?;
 
     self.message_receiver.add_reader(new_reader);
     Ok(())
@@ -399,14 +521,19 @@ impl Domain<timer_state::Init, buf_ring_state::Init> {
   pub(crate) fn add_local_writer(
     &mut self,
     writer_ing: WriterIngredients,
-    _udp_sender: &UDPSender,
+    udp_sender: &UDPSender,
     ring: &mut io_uring::IoUring,
+    initialized: bool,
+    user: u8,
   ) -> std::io::Result<()> {
     let entity_id = writer_ing.guid.entity_id;
     let domain_id = self.domain_info.domain_id;
 
-    let new_writer = Writer::new(writer_ing).register(ring, domain_id)?;
-    //new_writer.handle_heartbeat_tick(false, udp_sender, ring);
+    let mut new_writer = Writer::new(writer_ing).register(ring, domain_id, user)?;
+
+    if initialized {
+      new_writer.handle_heartbeat_tick(false, udp_sender, ring);
+    }
 
     self.writers.insert(entity_id, new_writer);
     Ok(())
@@ -461,6 +588,15 @@ impl Domain<timer_state::Init, buf_ring_state::Init> {
       }
     }
   }
+
+  pub fn domain_ref<'a, 'b>(
+    &'a mut self,
+    ring: &'b mut IoUring,
+    discovery: &'b mut Discovery2<timer_state::Init>,
+    udp_sender: &'b UDPSender,
+  ) -> DomainRef<'a, 'b> {
+    DomainRef::new(&mut self.writers, ring, discovery, udp_sender)
+  }
 }
 
 pub struct DomainRef<'a, 'b> {
@@ -486,9 +622,10 @@ impl<'a, 'b> DomainRef<'a, 'b> {
   }
 }
 
-use crate::io_uring::discovery::{Caches, Cache, DiscoveredKind};
-
-use crate::discovery::{DiscoveredTopicData, SpdpDiscoveredParticipantData, ParticipantMessageData};
+use crate::{
+  discovery::{DiscoveredTopicData, ParticipantMessageData, SpdpDiscoveredParticipantData},
+  io_uring::discovery::{Cache, Caches, DiscoveredKind},
+};
 
 struct Builtins<'a> {
   publications: Option<&'a mut Cache<DiscoveredWriterData, timer_state::Init>>,
@@ -510,19 +647,17 @@ impl<'a> Builtins<'a> {
   }
 }
 
-struct UpdatedParticipant2<'a, F> {
+pub(crate) struct UpdatedParticipant2<'a> {
   builtins: Builtins<'a>,
   writers_list: vec::IntoIter<(EntityId, EntityId, u32)>,
   readers_list: vec::IntoIter<(EntityId, EntityId, u32)>,
   discovered_participant: crate::discovery::SpdpDiscoveredParticipantData,
-  f: F,
 }
 
-impl<'a, F> UpdatedParticipant2<'a, F> {
-  fn new(
+impl<'a> UpdatedParticipant2<'a> {
+  pub(crate) fn new(
     caches: &'a mut Caches<timer_state::Init>,
     discovered_participant: crate::discovery::SpdpDiscoveredParticipantData,
-    f: F,
   ) -> Self {
     let builtins = Builtins::new(caches);
     let writers_list = crate::rtps::constant::STANDARD_BUILTIN_WRITERS_INIT_LIST
@@ -537,18 +672,16 @@ impl<'a, F> UpdatedParticipant2<'a, F> {
       writers_list,
       readers_list,
       discovered_participant,
-      f,
     }
   }
 }
 
-impl<'a, F> Iterator for UpdatedParticipant2<'a, F> 
-where F: FnMut(MinimalHBData)
-{
+impl<'a> Iterator for UpdatedParticipant2<'a> {
   type Item = DomainStatusEvent;
 
   fn next(&mut self) -> Option<Self::Item> {
     while let Some((writer_eid, reader_eid, endpoint)) = self.readers_list.next() {
+      println!("reader list: {writer_eid:?}");
       if !self
         .discovered_participant
         .available_builtin_endpoints
@@ -569,9 +702,9 @@ where F: FnMut(MinimalHBData)
             ..
           },
         ) => {
-            let ret = cache.update_reader_proxy(&reader_proxy);
-            //(self.f)(cache.minimal_hb());
-            (ret, cache.writer_guid)
+          let ret = cache.update_reader_proxy(&reader_proxy);
+          //(self.f)(cache.minimal_hb());
+          (ret, cache.writer_guid)
         }
         (
           EntityId::SEDP_BUILTIN_TOPIC_WRITER,
@@ -580,9 +713,9 @@ where F: FnMut(MinimalHBData)
             ..
           },
         ) => {
-            let ret = cache.update_reader_proxy(&reader_proxy);
-            //(self.f)(cache.minimal_hb());
-            (ret, cache.writer_guid)
+          let ret = cache.update_reader_proxy(&reader_proxy);
+          //(self.f)(cache.minimal_hb());
+          (ret, cache.writer_guid)
         }
         (
           EntityId::SPDP_BUILTIN_PARTICIPANT_WRITER,
@@ -591,9 +724,8 @@ where F: FnMut(MinimalHBData)
             ..
           },
         ) => {
-            let ret = cache.update_reader_proxy(&reader_proxy);
-            (self.f)(cache.minimal_hb());
-            (ret, cache.writer_guid)
+          let ret = cache.update_reader_proxy(&reader_proxy);
+          (ret, cache.writer_guid)
         }
         (
           EntityId::SEDP_BUILTIN_SUBSCRIPTIONS_WRITER,
@@ -602,9 +734,8 @@ where F: FnMut(MinimalHBData)
             ..
           },
         ) => {
-            let ret = cache.update_reader_proxy(&reader_proxy);
-            (self.f)(cache.minimal_hb());
-            (ret, cache.writer_guid)
+          let ret = cache.update_reader_proxy(&reader_proxy);
+          (ret, cache.writer_guid)
         }
         (
           EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_WRITER,
@@ -623,11 +754,9 @@ where F: FnMut(MinimalHBData)
             qos.reliability = Some(policy::Reliability::BestEffort);
 
             let ret = cache.update_reader_proxy_with_qos(&reader_proxy, &qos);
-            (self.f)(cache.minimal_hb());
             ret
           } else {
             let ret = cache.update_reader_proxy(&reader_proxy);
-            (self.f)(cache.minimal_hb());
             ret
           };
           (upd, cache.writer_guid)
@@ -646,6 +775,7 @@ where F: FnMut(MinimalHBData)
     }
 
     while let Some((writer_eid, reader_eid, endpoint)) = self.writers_list.next() {
+      println!("writer list: {writer_eid:?}");
       if !self
         .discovered_participant
         .available_builtin_endpoints
@@ -882,9 +1012,7 @@ impl<'a, 'c, 'f> Iterator for CleanupLostParticipant<'a, 'c, 'f> {
 }
 
 use crate::io_uring::discovery::ParticipantCleanup;
-
-use super::writer::LostReaders;
-use super::reader::LostWriters;
+use super::{reader::LostWriters, writer::LostReaders};
 
 struct LostParticipant2<'a, 'b> {
   guid_prefix: GuidPrefix,
@@ -922,7 +1050,7 @@ impl<'a, 'b> LostParticipant2<'a, 'b> {
   }
 }
 
-use crate::io_uring::discovery::{BuiltinParticipantLost};
+use crate::io_uring::discovery::BuiltinParticipantLost;
 
 enum BuiltinLostParticipantState {
   Publications,
@@ -968,18 +1096,21 @@ use std::collections::HashMap;
 
 use crate::{
   dds::{qos::policy, statusevents::DomainParticipantStatusEvent},
-  discovery::{
-    sedp_messages::{DiscoveredReaderData, DiscoveredWriterData},
+  discovery::sedp_messages::{DiscoveredReaderData, DiscoveredWriterData},
+  io_uring::{
+    network::udp_sender::UDPSender,
+    rtps::{
+      message_receiver::MessageReceiver,
+      reader::{Reader, ReaderIngredients},
+      writer::{Writer, WriterIngredients},
+    },
   },
-  rtps::{constant::*, rtps_reader_proxy::RtpsReaderProxy, rtps_writer_proxy::RtpsWriterProxy},
+  rtps::{
+    constant::*, dp_event_loop::DomainInfo, rtps_reader_proxy::RtpsReaderProxy,
+    rtps_writer_proxy::RtpsWriterProxy,
+  },
   structure::guid::{EntityId, GuidPrefix, GUID},
 };
-
-use crate::io_uring::rtps::writer::{Writer, WriterIngredients};
-use crate::io_uring::rtps::message_receiver::MessageReceiver;
-use crate::io_uring::rtps::reader::{Reader, ReaderIngredients};
-use crate::io_uring::network::udp_sender::UDPSender;
-
 #[cfg(feature = "security")]
 use crate::{
   discovery::secure_discovery::AuthenticationStatus,
@@ -987,77 +1118,63 @@ use crate::{
   security_warn,
 };
 
-use crate::rtps::dp_event_loop::DomainInfo;
-
-struct DiscoveredUpdates2<C, U, F> {
+struct DiscoveredUpdates2<C, U> {
   remote: C,
   remote_discovered: U,
-  f: F,
 }
 
-type DiscoveredReaderUpdates2<'a, F> = DiscoveredUpdates2<
+type DiscoveredReaderUpdates2<'a> = DiscoveredUpdates2<
   hash_map::ValuesMut<'a, EntityId, Writer<timer_state::Init>>,
   DiscoveredReaderData,
-  F,
 >;
 
-impl<'a, F>
+impl<'a>
   DiscoveredUpdates2<
     hash_map::ValuesMut<'a, EntityId, Writer<timer_state::Init>>,
     DiscoveredReaderData,
-    F,
   >
 {
   fn new_reader_data(
     map: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
     reader_data: DiscoveredReaderData,
-    f: F,
   ) -> Self {
     Self {
       remote: map.values_mut(),
       remote_discovered: reader_data,
-      f,
     }
   }
 }
 
-type DiscoveredWriterUpdates2<'a, F> = DiscoveredUpdates2<
+type DiscoveredWriterUpdates2<'a> = DiscoveredUpdates2<
   btree_map::ValuesMut<'a, EntityId, Reader<timer_state::Init>>,
   DiscoveredWriterData,
-  F,
 >;
 
-impl<'a, F>
+impl<'a>
   DiscoveredUpdates2<
     btree_map::ValuesMut<'a, EntityId, Reader<timer_state::Init>>,
     DiscoveredWriterData,
-    F,
   >
 {
   fn new_writer_data(
     map: &'a mut BTreeMap<EntityId, Reader<timer_state::Init>>,
     writer_data: DiscoveredWriterData,
-    f: F,
   ) -> Self {
     Self {
       remote: map.values_mut(),
       remote_discovered: writer_data,
-      f,
     }
   }
 }
 
 use std::collections::hash_map;
 
-impl<'a, F> Iterator
+impl<'a> Iterator
   for DiscoveredUpdates2<
     hash_map::ValuesMut<'a, EntityId, Writer<timer_state::Init>>,
     DiscoveredReaderData,
-    F,
   >
-where F: FnMut(MinimalHBData)
 {
-
   type Item = (DataWriterStatus, DomainParticipantStatusEvent);
 
   fn next(&mut self) -> Option<Self::Item> {
@@ -1090,13 +1207,11 @@ where F: FnMut(MinimalHBData)
 
 use std::collections::btree_map;
 
-impl<'a, F> Iterator
+impl<'a> Iterator
   for DiscoveredUpdates2<
     btree_map::ValuesMut<'a, EntityId, Reader<timer_state::Init>>,
     DiscoveredWriterData,
-    F,
   >
-where F: FnMut(MinimalHBData)
 {
   type Item = (DataReaderStatus, DomainParticipantStatusEvent);
 
@@ -1264,8 +1379,6 @@ impl<'a, 'c, 'd, 'e, 'f> Iterator for DDIState<'a, 'c, 'd, 'e, 'f> {
 }
 */
 
-use crate::io_uring::discovery::MinimalHBData;
-
 fn iterate_events(
   discovery: &mut Discovery2<timer_state::Init>,
   discovery_db: &mut DiscoveryDB,
@@ -1274,55 +1387,70 @@ fn iterate_events(
   discovered: &mut DiscoveredKind,
   ring: &mut IoUring,
   udp_sender: &UDPSender,
-  mut f: impl FnMut(DomainStatusEvent),
+  mut f: impl for<'a> FnMut(DomainStatusEvent, DomainRef<'a, 'a>),
 ) {
-    let mut discovered = Discovered::new(discovery, discovery_db, discovered);
-    while let Some((mut discovery_status, mut status)) = discovered.next() {
-        if let Some(participant_status) = core::mem::take(&mut status) {
-            f(DomainStatusEvent::Participant(participant_status));
-        }
-
-        //SAFETY: there should not be any overlap.
-        // move the ring into each of the fns?
-        let ring_2 = unsafe {&mut *(ring as *mut _)};
-         //it happens regardless???
-        let mut func = |hb: MinimalHBData| 
-            ();
-            //hb.send_inital_cache_change(udp_sender, ring_2);
-
-        let Some((mut dstate, mut status)) = DState::new(
-            discovery_status,
-            readers,
-            writers,
-            &mut discovered.discovery.caches,
-            ring,
-            discovered.discovery_db,
-            udp_sender,
-            &mut func,
-            ) else {
-            continue;
-        };
-
-        if let Some(participant_status) = core::mem::take(&mut status) {
-            f(DomainStatusEvent::Participant(participant_status));
-        }
-
-        while let Some(status) = dstate.next() {
-            f(status);
-        }
+  let mut discovered = Discovered::new(discovery, discovery_db, discovered);
+  while let Some((discovery_status, mut status)) = discovered.next() {
+    if let Some(participant_status) = core::mem::take(&mut status) {
+      f(
+        DomainStatusEvent::Participant(participant_status),
+        DomainRef::new(writers, ring, discovered.discovery, udp_sender),
+      );
     }
+
+    //SAFETY: there should not be any overlap.
+    // move the ring into each of the fns?
+    //let ring_2 = unsafe {&mut *(ring as *mut _)};
+    //it happens regardless???
+    // SAFETY: this is only used between iterations
+    // which will not effect the underlying collection
+    //
+    // and is only used outisde of processing elements in the iteration
+    let (discovery_reborrow, writers_reborrow) = unsafe {
+      (
+        &mut *(discovered.discovery as *mut _),
+        &mut *(writers as *mut _),
+      )
+    };
+
+    let Some((mut dstate, mut status)) = DState::new(
+      discovery_status,
+      readers,
+      writers,
+      &mut discovered.discovery.caches,
+      ring,
+      discovered.discovery_db,
+      udp_sender,
+    ) else {
+      continue;
+    };
+
+    if let Some(participant_status) = core::mem::take(&mut status) {
+      f(
+        DomainStatusEvent::Participant(participant_status),
+        DomainRef::new(writers_reborrow, ring, discovery_reborrow, udp_sender),
+      );
+    }
+
+    while let Some(status) = dstate.next() {
+      f(
+        status,
+        DomainRef::new(writers_reborrow, ring, discovery_reborrow, udp_sender),
+      );
+    }
+  }
 }
 
-enum DState<'a, 'b, F> {
+enum DState<'a, 'b> {
   ReaderLost(LostReaderUpdates<'a>),
-  ReaderUpdates(DiscoveredReaderUpdates2<'a, F>),
+  ReaderUpdates(DiscoveredReaderUpdates2<'a>),
   WriterLost(LostWriterUpdates<'a>),
-  WriterUpdates(DiscoveredWriterUpdates2<'a, F>),
+  WriterUpdates(DiscoveredWriterUpdates2<'a>),
   ParticipantLost(LostParticipant2<'a, 'b>),
-  ParticipantUpdates(UpdatedParticipant2<'b, F>),
+  ParticipantUpdates(UpdatedParticipant2<'b>),
 }
 
-impl<'a, 'b, F> DState<'a, 'b, F> {
+impl<'a, 'b> DState<'a, 'b> {
   fn new(
     notif: DiscoveryNotificationType,
     readers: &'a mut BTreeMap<EntityId, Reader<timer_state::Init>>,
@@ -1331,7 +1459,6 @@ impl<'a, 'b, F> DState<'a, 'b, F> {
     ring: &mut IoUring,
     discovery_db: &mut DiscoveryDB,
     udp_sender: &UDPSender,
-    f: F,
   ) -> Option<(Self, Option<DomainParticipantStatusEvent>)> {
     use DiscoveryNotificationType as DDT;
 
@@ -1340,6 +1467,7 @@ impl<'a, 'b, F> DState<'a, 'b, F> {
         discovered_writer_data,
       } => {
         use chrono::Utc;
+
         use crate::EndpointDescription;
         let domain_ev = DomainParticipantStatusEvent::WriterDetected {
           writer: EndpointDescription {
@@ -1360,7 +1488,6 @@ impl<'a, 'b, F> DState<'a, 'b, F> {
         let state = Self::WriterUpdates(DiscoveredWriterUpdates2::new_writer_data(
           readers,
           discovered_writer_data,
-          f,
         ));
 
         Some((state, Some(domain_ev)))
@@ -1373,6 +1500,7 @@ impl<'a, 'b, F> DState<'a, 'b, F> {
         discovered_reader_data,
       } => {
         use chrono::Utc;
+
         use crate::EndpointDescription;
         let domain_ev = DomainParticipantStatusEvent::ReaderDetected {
           reader: EndpointDescription {
@@ -1393,7 +1521,6 @@ impl<'a, 'b, F> DState<'a, 'b, F> {
         let state = Self::ReaderUpdates(DiscoveredReaderUpdates2::new_reader_data(
           writers,
           discovered_reader_data,
-          f,
         ));
 
         Some((state, Some(domain_ev)))
@@ -1407,7 +1534,7 @@ impl<'a, 'b, F> DState<'a, 'b, F> {
 
         //FIXME: this may be able to avoid a clone now.
         Some((
-          Self::ParticipantUpdates(UpdatedParticipant2::new(caches, participant_proxy.clone(), f)),
+          Self::ParticipantUpdates(UpdatedParticipant2::new(caches, participant_proxy.clone())),
           None,
         ))
       }
@@ -1429,9 +1556,7 @@ impl<'a, 'b, F> DState<'a, 'b, F> {
   }
 }
 
-impl<'a, 'b, F> Iterator for DState<'a, 'b, F> 
-where F: FnMut(MinimalHBData)
-{
+impl<'a, 'b> Iterator for DState<'a, 'b> {
   type Item = DomainStatusEvent;
 
   fn next(&mut self) -> Option<Self::Item> {
@@ -1479,7 +1604,7 @@ pub enum DomainStatusEvent {
 
 use std::vec;
 
-use crate::{DataWriterStatus, DataReaderStatus};
+use crate::{DataReaderStatus, DataWriterStatus};
 
 struct LostReaderUpdates<'a> {
   remote_writers: std::collections::hash_map::ValuesMut<'a, EntityId, Writer<timer_state::Init>>,

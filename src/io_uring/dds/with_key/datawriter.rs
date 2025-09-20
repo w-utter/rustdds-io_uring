@@ -13,8 +13,10 @@ use crate::{
     ddsdata::DDSData,
     qos::{policy::Liveliness, HasQoSPolicy, QosPolicies},
     result::{WriteError, WriteResult},
+    with_key::WriteOptions,
   },
   discovery::{discovery::DiscoveryCommand, sedp_messages::SubscriptionBuiltinTopicData},
+  io_uring::{dds::Topic, rtps::writer::WriterCommand},
   messages::submessages::elements::serialized_payload::SerializedPayload,
   serialization::CDRSerializerAdapter,
   structure::{
@@ -23,11 +25,6 @@ use crate::{
   },
   Keyed,
 };
-
-use crate::io_uring::dds::Topic;
-
-use crate::io_uring::rtps::writer::WriterCommand;
-use crate::dds::with_key::WriteOptions;
 
 /// Simplified type for CDR encoding
 pub type DataWriterCdr<D> = DataWriter<D, CDRSerializerAdapter<D>>;
@@ -106,7 +103,7 @@ pub struct DataSample<'a, D: Keyed, SA: SerializerAdapter<D>> {
 use crate::io_uring::rtps::DomainRef;
 
 impl<D: Keyed, SA: SerializerAdapter<D>> DataSample<'_, D, SA> {
-  pub fn write_to(self, domain: &mut DomainRef<'_, '_>) {
+  pub fn write_to(self, domain: &mut DomainRef<'_, '_>) -> bool {
     let Self {
       data_writer,
       cmd,
@@ -120,15 +117,17 @@ impl<D: Keyed, SA: SerializerAdapter<D>> DataSample<'_, D, SA> {
       udp_sender,
     } = domain;
 
-    if let Some(writer) = writers.get_mut(&data_writer.my_guid.entity_id) {
-      writer.process_command(udp_sender, ring, cmd);
-    }
+    let lost = writers
+      .get_mut(&data_writer.my_guid.entity_id)
+      .map(|writer| writer.process_command(udp_sender, ring, cmd))
+      .is_none();
 
     if refresh_manual_liveliness {
       discovery
         .liveliness_state
         .manual_participant_liveness_refresh_requested = true;
     }
+    lost
   }
 }
 
@@ -327,7 +326,8 @@ where
   /// ```
   pub fn wait_for_acknowledgments(&self, _max_wait: Duration) -> WriteResult<bool, ()> {
     //TODO: find a better way for this
-    // maybe (timer fd, can cancel it with the encoding and then handle it from there)
+    // maybe (timer fd, can cancel it with the encoding and then handle it from
+    // there)
     todo!()
     /*
     match &self.qos_policy.reliability {

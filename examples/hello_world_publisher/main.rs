@@ -86,18 +86,19 @@ fn main() {
         }
         _ = write_trigger_receiver.recv().fuse() => {
           println!("Sending hello");
+
           writer.async_write(hello_message.clone(), None)
             .unwrap_or_else(|e| error!("DataWriter async_write failed: {e:?}"))
             .await;
           // wait for 1 sec for transfer to complete before exiting.
-          Timer::after(Duration::from_secs(1)).await;
-          break
+          //Timer::after(Duration::from_secs(1)).await;
+          //break
         }
         e = datawriter_event_stream.select_next_some() => {
           match e {
             // If we get a matching subscription, trigger the send
             DataWriterStatus::PublicationMatched{..} => {
-              println!("Matched with hello subscriber");
+              println!("\nMatched with hello subscriber\n\n\n\n\n");
               // Wait for a while so that subscriber also recognizes us.
               // There is no two- or three-way handshake in pub/sub matching,
               // so we cannot know if the other side is immediately ready.

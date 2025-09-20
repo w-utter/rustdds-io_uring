@@ -1,13 +1,14 @@
-use crate::dds::result::{CreateResult, CreateError};
-use crate::create_error_out_of_resources;
+use std::net::{IpAddr, Ipv4Addr};
 
 use io_uring_buf_ring::{buf_ring_state, BufferId};
-use crate::io_uring::network::udp_listener::UDPListener;
-use crate::network::constant as network;
-use std::net::{IpAddr, Ipv4Addr};
-use crate::io_uring::encoding::user_data::UdpDataRecv;
-
 use log::{info, warn};
+
+use crate::{
+  create_error_out_of_resources,
+  dds::result::{CreateError, CreateResult},
+  io_uring::{encoding::user_data::UdpDataRecv, network::udp_listener::UDPListener},
+  network::constant as network,
+};
 
 // section 9.6.1.1 discovery traffic
 pub struct UdpListeners<S> {
@@ -109,6 +110,7 @@ impl UdpListeners<buf_ring_state::Uninit> {
     ring: &mut io_uring::IoUring,
     buf_id: &mut u16,
     domain_id: u16,
+    user: u8,
   ) -> std::io::Result<UdpListeners<buf_ring_state::Init>> {
     let Self {
       multicast_discovery,
@@ -118,18 +120,39 @@ impl UdpListeners<buf_ring_state::Uninit> {
     } = self;
 
     let multicast_discovery = multicast_discovery
-      .map(|disc| disc.register(ring, buf_id, domain_id, UdpDataRecv::MulticastDiscovery))
+      .map(|disc| {
+        disc.register(
+          ring,
+          buf_id,
+          domain_id,
+          UdpDataRecv::MulticastDiscovery,
+          user,
+        )
+      })
       .transpose()?;
 
     let unicast_discovery =
-      unicast_discovery.register(ring, buf_id, domain_id, UdpDataRecv::UnicastDiscovery)?;
+      unicast_discovery.register(ring, buf_id, domain_id, UdpDataRecv::UnicastDiscovery, user)?;
 
     let multicast_user_traffic = multicast_user_traffic
-      .map(|disc| disc.register(ring, buf_id, domain_id, UdpDataRecv::MulticastUserTraffic))
+      .map(|disc| {
+        disc.register(
+          ring,
+          buf_id,
+          domain_id,
+          UdpDataRecv::MulticastUserTraffic,
+          user,
+        )
+      })
       .transpose()?;
 
-    let unicast_user_traffic =
-      unicast_user_traffic.register(ring, buf_id, domain_id, UdpDataRecv::UnicastUserTraffic)?;
+    let unicast_user_traffic = unicast_user_traffic.register(
+      ring,
+      buf_id,
+      domain_id,
+      UdpDataRecv::UnicastUserTraffic,
+      user,
+    )?;
 
     Ok(UdpListeners {
       multicast_discovery,
@@ -217,6 +240,46 @@ impl UdpListeners<buf_ring_state::Init> {
     DiscoveryTrafficLocators {
       multicast_discovery,
       unicast_discovery,
+    }
+  }
+
+  pub(crate) fn try_fix_err(
+    &mut self,
+    err: Option<i32>,
+    variant: UdpDataRecv,
+    domain_id: u16,
+    user: u8,
+    ring: &mut io_uring::IoUring,
+  ) -> std::io::Result<()> {
+    if let Some(105) = err {
+      match variant {
+        UdpDataRecv::UnicastUserTraffic => self
+          .unicast_user_traffic
+          .setup_recv_multi(domain_id, variant, user, ring),
+        UdpDataRecv::MulticastUserTraffic => {
+          let Some(traffic) = self.multicast_user_traffic.as_mut() else {
+            return Err(std::io::Error::new(
+              std::io::ErrorKind::NotFound,
+              "multicast user traffic not found",
+            ));
+          };
+          traffic.setup_recv_multi(domain_id, variant, user, ring)
+        }
+        UdpDataRecv::MulticastDiscovery => {
+          let Some(discovery) = self.multicast_discovery.as_mut() else {
+            return Err(std::io::Error::new(
+              std::io::ErrorKind::NotFound,
+              "multicast discovery not found",
+            ));
+          };
+          discovery.setup_recv_multi(domain_id, variant, user, ring)
+        }
+        UdpDataRecv::UnicastDiscovery => self
+          .unicast_discovery
+          .setup_recv_multi(domain_id, variant, user, ring),
+      }
+    } else {
+      Err(std::io::Error::from_raw_os_error(err.unwrap()))
     }
   }
 }

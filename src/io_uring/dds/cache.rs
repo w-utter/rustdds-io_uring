@@ -1,12 +1,11 @@
 use std::collections::HashMap;
 
-use crate::structure::dds_cache::TopicCache;
-use crate::dds::typedesc::TypeDesc;
-use crate::dds::qos::QosPolicies;
-
-use crate::dds::{CreateError, CreateResult};
-use crate::create_error_internal;
-use crate::Timestamp;
+use crate::{
+  create_error_internal,
+  dds::{qos::QosPolicies, typedesc::TypeDesc, CreateError, CreateResult},
+  structure::dds_cache::TopicCache,
+  Timestamp,
+};
 
 #[derive(Default)]
 pub struct DDSCache {

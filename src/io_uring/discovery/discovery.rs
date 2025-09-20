@@ -1,29 +1,15 @@
 // TODO: this whole file.
 // (that might also mean that datareader/datawriter cdr
-use std::{time::Duration as StdDuration};
-use crate::io_uring::discovery::traffic::{UdpListeners, TrafficLocators};
+use std::time::Duration as StdDuration;
+
 use io_uring_buf_ring::buf_ring_state;
-use crate::io_uring::rtps::Domain;
-
 use io_uring::IoUring;
-use crate::io_uring::discovery::discovery_db::DiscoveredVia;
-use crate::TopicCache;
-use crate::dds::ddsdata::DDSData;
-use crate::SequenceNumber;
-use crate::WriteOptions;
-use crate::io_uring::network::UDPSender;
-
-use crate::dds::{ReadError, ReadResult};
-use crate::structure::cache_change::CacheChange;
-use crate::with_key::DeserializedCacheChange;
-
-use crate::rtps::message_receiver::MessageReceiverState;
-
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 
 use crate::{
   dds::{
+    ddsdata::DDSData,
     qos::{
       policy::{
         Deadline, DestinationOrder, Durability, History, Liveliness, Ownership, Presentation,
@@ -32,28 +18,37 @@ use crate::{
       QosPolicies, QosPolicyBuilder,
     },
     readcondition::ReadCondition,
-    result::{WriteResult, WriteError},
+    result::{WriteError, WriteResult},
     statusevents::{DomainParticipantStatusEvent, LostReason},
+    ReadError, ReadResult,
   },
   discovery::{
+    discovery::LivelinessState,
     sedp_messages::{
       DiscoveredReaderData, DiscoveredTopicData, DiscoveredWriterData, ParticipantMessageData,
       ParticipantMessageDataKind,
     },
-    spdp_participant_data::{SpdpDiscoveredParticipantData},
+    spdp_participant_data::SpdpDiscoveredParticipantData,
   },
-  rtps::constant::*,
+  io_uring::{
+    discovery::{
+      discovery_db::{DiscoveredVia, DiscoveryDB},
+      traffic::{TrafficLocators, UdpListeners},
+    },
+    network::UDPSender,
+    rtps::Domain,
+  },
+  rtps::{constant::*, message_receiver::MessageReceiverState},
   serialization::{pl_cdr_adapters::*, CDRSerializerAdapter},
   structure::{
+    cache_change::CacheChange,
     duration::Duration,
     guid::{EntityId, GuidPrefix, GUID},
     time::Timestamp,
   },
-  with_key::{Sample, DataSample},
+  with_key::{DataSample, DeserializedCacheChange, Sample},
+  SequenceNumber, TopicCache, WriteOptions,
 };
-
-use crate::io_uring::discovery::discovery_db::DiscoveryDB;
-
 // This module implements the control logic of the Discovery process.
 //
 // The built-in discovery consists of
@@ -84,10 +79,8 @@ use crate::{
 };
 #[cfg(not(feature = "security"))]
 use crate::no_security::*;
-
-use crate::discovery::discovery::LivelinessState;
 //use crate::discovery::discovery::NormalDiscoveryPermission;
-use crate::io_uring::timer::{Timer, timer_state};
+use crate::io_uring::timer::{timer_state, Timer};
 
 struct Timers<T> {
   participant_cleanup: Timer<(), T>,
@@ -96,19 +89,15 @@ struct Timers<T> {
   participant_messages: Timer<(), T>,
 }
 
-use crate::with_key::ReadState;
-
-use crate::dds::key::Key;
-use crate::with_key::datasample_cache::DataSampleCache;
-use crate::rtps::writer::HistoryBuffer;
-
-use crate::rtps::rtps_reader_proxy::RtpsReaderProxy;
-use crate::rtps::rtps_writer_proxy::RtpsWriterProxy;
-
-use crate::io_uring::rtps::reader;
-use crate::io_uring::rtps::writer;
-
-use crate::rtps::fragment_assembler::FragmentAssembler;
+use crate::{
+  dds::key::Key,
+  io_uring::rtps::{reader, writer},
+  rtps::{
+    fragment_assembler::FragmentAssembler, rtps_reader_proxy::RtpsReaderProxy,
+    rtps_writer_proxy::RtpsWriterProxy, writer::HistoryBuffer,
+  },
+  with_key::{datasample_cache::DataSampleCache, ReadState},
+};
 
 pub(crate) struct Cache<D: Keyed, S> {
   pub(crate) qos: QosPolicies,
@@ -133,12 +122,13 @@ pub(crate) struct Cache<D: Keyed, S> {
   writer_timers: writer::Timers<S>,
 }
 
-use crate::dds::key::KeyHash;
 use std::collections::BTreeMap;
-use crate::with_key::{DeserializerAdapter, SerializerAdapter, DefaultDecoder};
 
-use crate::dds::statusevents::CountWithChange;
-use crate::{DataWriterStatus, DataReaderStatus};
+use crate::{
+  dds::{key::KeyHash, statusevents::CountWithChange},
+  with_key::{DefaultDecoder, DeserializerAdapter, SerializerAdapter},
+  DataReaderStatus, DataWriterStatus,
+};
 
 impl<D: Keyed> Cache<D, timer_state::Uninit> {
   fn new(
@@ -208,6 +198,7 @@ impl<D: Keyed> Cache<D, timer_state::Uninit> {
     self,
     ring: &mut IoUring,
     domain_id: u16,
+    user: u8,
   ) -> std::io::Result<Cache<D, timer_state::Init>> {
     let Self {
       topic,
@@ -231,8 +222,8 @@ impl<D: Keyed> Cache<D, timer_state::Uninit> {
       fragment_assemblers,
     } = self;
 
-    let reader_timers = reader_timers.register(ring, reader_guid.entity_id, domain_id)?;
-    let writer_timers = writer_timers.register(ring, domain_id, writer_guid.entity_id)?;
+    let reader_timers = reader_timers.register(ring, reader_guid.entity_id, domain_id, user)?;
+    let writer_timers = writer_timers.register(ring, domain_id, writer_guid.entity_id, user)?;
 
     Ok(Cache {
       topic,
@@ -360,13 +351,19 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
     } // match
   }
 
-  fn update_and_send(&mut self, data: DDSData, udp_sender: &UDPSender, ring: &mut IoUring) {
+  fn update_and_send(
+    &mut self,
+    data: DDSData,
+    udp_sender: &UDPSender,
+    ring: &mut IoUring,
+    initialized: bool,
+  ) {
     let sequence_number = self.sequence_number;
 
     self.sequence_number += 1;
 
-    // NOTE: manual liveliness assertions are not checked as all builtin livelinesses are
-    // either automatic or none.
+    // NOTE: manual liveliness assertions are not checked as all builtin
+    // livelinesses are either automatic or none.
     //Ok((ddsdata, WriteOptions::from(None), sequence_number.into()))
 
     let cc = CacheChange::new(
@@ -378,6 +375,10 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
     let timestamp = Timestamp::now();
 
     self.history_buffer.add_change(timestamp, cc);
+
+    if !initialized {
+      return;
+    }
 
     // assuming that all builtin writers are operating only in push mode
     // and that all builtin writers are broadcasting
@@ -392,8 +393,7 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
 
         let endianness = speedy::Endianness::LittleEndian;
 
-        use crate::rtps::MessageBuilder;
-        use crate::structure::sequence_number::FragmentNumber;
+        use crate::{rtps::MessageBuilder, structure::sequence_number::FragmentNumber};
 
         let send_also_heartbeat = true;
 
@@ -417,8 +417,8 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
             reader_entity_id,
             self.writer_guid, // writer
             endianness,
-            None, //TODO
-                  //self.security_plugins.as_ref(),
+            None, /*TODO
+                   *self.security_plugins.as_ref(), */
           );
 
           // Add HEARTBEAT if needed
@@ -466,8 +466,8 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
               fragment_size,
               data_size.try_into().unwrap(),
               endianness,
-              None, // TODO
-                    //self.security_plugins.as_ref(),
+              None, /* TODO
+                     *self.security_plugins.as_ref(), */
             );
 
             let datafrag_msg = message_builder.add_header_and_build(self.writer_guid.prefix);
@@ -498,6 +498,7 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
 
       for msg in messages_to_send {
         use speedy::Endianness;
+
         use crate::rtps::writer::DeliveryMode;
         crate::io_uring::rtps::Writer::send_message_to_readers(
           Endianness::LittleEndian,
@@ -516,6 +517,7 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
     data: D,
     udp_sender: &UDPSender,
     ring: &mut IoUring,
+    initialized: bool,
   ) -> WriteResult<(), D> {
     // serialize
     let send_buffer = match SA::to_bytes(&data) {
@@ -534,7 +536,7 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
       send_buffer,
     ));
 
-    self.update_and_send(ddsdata, udp_sender, ring);
+    self.update_and_send(ddsdata, udp_sender, ring, initialized);
     Ok(())
   }
 
@@ -543,6 +545,7 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
     key: &<D as Keyed>::K,
     udp_sender: &UDPSender,
     ring: &mut IoUring,
+    initialized: bool,
   ) -> WriteResult<(), ()> {
     let send_buffer = match SA::key_to_bytes(key) {
       Ok(b) => b,
@@ -560,7 +563,7 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
       send_buffer,
     ));
 
-    self.update_and_send(ddsdata, udp_sender, ring);
+    self.update_and_send(ddsdata, udp_sender, ring, initialized);
 
     Ok(())
   }
@@ -593,6 +596,15 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
     hash_to_key_map.insert(instance_key.hash_key(false), instance_key);
   }
 
+  // TODO: this is not called at the start
+  // - therefore the default locators are never given
+  // - => none of the stuff is discoverable until the thing is ready
+  // - the stuff is there for it but its never called
+  //    - an issue with how UpdatedParticipant works?
+  //    - this is propagated by DState, so its just a matter of not iterating over
+  //      it
+  //      - might be better to have a minimum viable DState that only works with
+  //        builtins to see whats going wrong
   pub(crate) fn update_reader_proxy(
     &mut self,
     reader_proxy: &RtpsReaderProxy,
@@ -784,13 +796,14 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
 
     let reader_id = self.reader_guid.entity_id;
 
-    use crate::structure::sequence_number::SequenceNumberSet;
-    use crate::messages::submessages::submessages::AckNack;
-    use crate::messages::submessages::submessages::ACKNACK_Flags;
     use enumflags2::BitFlags;
-    use crate::messages::submessages::submessages::NACKFRAG_Flags;
-    use crate::structure::locator::Locator;
-    use crate::messages::submessages::submessages::InfoDestination;
+
+    use crate::{
+      messages::submessages::submessages::{
+        ACKNACK_Flags, AckNack, InfoDestination, NACKFRAG_Flags,
+      },
+      structure::{locator::Locator, sequence_number::SequenceNumberSet},
+    };
 
     let missing_seqnums = proxy.missing_seqnums(heartbeat.first_sn, heartbeat.last_sn);
 
@@ -838,6 +851,8 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
         None => SequenceNumberSet::new_empty(proxy.all_ackable_before()),
       };
 
+      //panic!("{partially_received:?}, {missing_seqnums:?}");
+
       let response_ack_nack = AckNack {
         reader_id,
         writer_id: heartbeat.writer_id,
@@ -869,6 +884,9 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
 
       let _nackfrag_flags = BitFlags::<NACKFRAG_Flags>::from_flag(NACKFRAG_Flags::Endianness);
 
+      if !partially_received.is_empty() {
+        todo!()
+      }
       // send NackFrags, if any
       //let mut nackfrags = Vec::new();
       /* TODO:
@@ -929,10 +947,12 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
         },
       );
 
-      use speedy::{Writable, Endianness};
+      use speedy::{Endianness, Writable};
       let bytes = acknack_msg
         .write_to_vec_with_ctx(Endianness::LittleEndian)
         .unwrap();
+
+      println!("sending acknack to {reply_locators:?}");
 
       udp_sender
         .send_to_locator_list(&bytes, reply_locators, ring)
@@ -950,11 +970,10 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
     acknack: AckNack,
     info_dst: InfoDestination,
   ) -> Message {
-    use crate::messages::submessages::submessages::INFODESTINATION_Flags;
-    use crate::messages::header::Header;
-    use crate::messages::protocol_id::ProtocolId;
-    use crate::messages::protocol_version::ProtocolVersion;
-    use crate::messages::vendor_id::VendorId;
+    use crate::messages::{
+      header::Header, protocol_id::ProtocolId, protocol_version::ProtocolVersion,
+      submessages::submessages::INFODESTINATION_Flags, vendor_id::VendorId,
+    };
 
     let infodst_flags =
       BitFlags::<INFODESTINATION_Flags>::from_flag(INFODESTINATION_Flags::Endianness);
@@ -1009,7 +1028,7 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
         },
       );
 
-      use speedy::{Writable, Endianness};
+      use speedy::{Endianness, Writable};
 
       let bytes = acknack
         .write_to_vec_with_ctx(Endianness::LittleEndian)
@@ -1026,6 +1045,7 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
     reader_guid_prefix: GuidPrefix,
     ring: &mut IoUring,
     domain_id: u16,
+    user: u8,
   ) {
     if !self.qos.is_reliable() {
       return;
@@ -1064,10 +1084,13 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
           // if we cannot send more data, we are done.
           // This is to prevent empty "repair data" messages from being sent.
 
+          /*
           if reader_guid.prefix == self.writer_guid.prefix {
             return;
           }
+          */
 
+          println!("{:?} > {last_seq:?}", reader_proxy.all_acked_before);
           if reader_proxy.all_acked_before > last_seq {
             reader_proxy.repair_mode = false;
           } else {
@@ -1078,8 +1101,8 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
               crate::rtps::constant::NACK_RESPONSE_DELAY.into(),
               domain_id,
               ring,
+              user,
             );
-            //println!("set up repair timer for {:?} to reader {:?}", self.writer_guid, reader_guid,);
           }
 
           if !reader_proxy.get_pending_gap().is_empty() {
@@ -1106,6 +1129,7 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
     udp_sender: &UDPSender,
     ring: &mut IoUring,
   ) {
+    println!("builtin: {ev:?}");
     use user_data::WriteTimerVariant;
     match ev {
       WriteTimerVariant::Heartbeat => {
@@ -1149,10 +1173,16 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
     };
 
     use std::collections::BTreeSet;
-    use crate::rtps::MessageBuilder;
-    use crate::rtps::writer::DeliveryMode;
+
+    use crate::rtps::{writer::DeliveryMode, MessageBuilder};
+
+    println!(
+      "unsent changes: {:?} to {reader_guid:?}",
+      reader_proxy.unsent_changes_debug()
+    );
 
     if let Some(unsent_sn) = reader_proxy.first_unsent_change() {
+      println!("{unsent_sn:?} is unsent according to reader_proxy");
       // There are unsent changes.
       let mut no_longer_relevant: BTreeSet<SequenceNumber> = BTreeSet::new();
       let mut all_irrelevant_before = None;
@@ -1228,6 +1258,8 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
               let data_msg = message_builder.add_header_and_build(self.writer_guid.prefix);
               messages_to_send.push(data_msg);
 
+              println!("sending msgs from repairdata: {messages_to_send:?}");
+
               for msg in messages_to_send {
                 crate::io_uring::rtps::Writer::send_message_to_readers(
                   speedy::Endianness::LittleEndian,
@@ -1261,6 +1293,7 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
             );
             */
           }
+          println!("marking {unsent_sn:?} as sent");
           // mark as sent
           reader_proxy.mark_change_sent(unsent_sn);
         } else {
@@ -1384,12 +1417,12 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
       .values()
       .all(|rp| last_change < rp.all_acked_before)
     {
+      println!("Readers have available data");
       trace!("heartbeat tick: all readers have all available data.");
       return;
     }
 
-    use crate::rtps::MessageBuilder;
-    use crate::rtps::writer::DeliveryMode;
+    use crate::rtps::{writer::DeliveryMode, MessageBuilder};
 
     let endianness = speedy::Endianness::LittleEndian;
 
@@ -1440,99 +1473,17 @@ impl<D: Keyed> Cache<D, timer_state::Init> {
     }
   }
 
-  pub(crate) fn minimal_hb(&mut self) -> MinimalHBData<'_> {
-      let heartbeat_count = self.next_heartbeat_count();
-      let Self {
-          history_buffer,
-          reader_proxies,
-          writer_guid,
-          ..
-      } = self;
-
-      MinimalHBData {
-          history_buffer,
-          reader_proxies,
-          writer_guid: *writer_guid,
-          heartbeat_count,
-      }
-  }
-
   fn handle_reader_timed_event(&mut self, _ev: &user_data::ReadTimerVariant) {
     todo!()
   }
 }
 
-pub(crate) struct MinimalHBData<'a> {
-    pub(crate) history_buffer: &'a HistoryBuffer,
-    pub(crate) reader_proxies: &'a BTreeMap<GUID, RtpsReaderProxy>,
-    pub(crate) writer_guid: GUID,
-    pub(crate) heartbeat_count: i32,
-}
-
-impl MinimalHBData<'_> {
-    pub(crate) fn send_inital_cache_change(self, udp_sender: &UDPSender, ring: &mut IoUring) {
-        let Self {
-            history_buffer,
-            reader_proxies,
-            writer_guid,
-            heartbeat_count,
-        } = self;
-
-        let final_flag = false;
-        let liveliness_flag = false;
-
-        let first_change = history_buffer.first_change_sequence_number();
-        let last_change = history_buffer.last_change_sequence_number();
-
-        if reader_proxies
-          .values()
-          .all(|rp| last_change < rp.all_acked_before)
-        {
-          trace!("heartbeat tick: all readers have all available data.");
-          return;
-        }
-
-        use crate::rtps::MessageBuilder;
-        use crate::rtps::writer::DeliveryMode;
-        use speedy::Endianness;
-
-        let endianness = speedy::Endianness::LittleEndian;
-
-        // the interface to .heartbeat_msg is silly: we give ref to ourself
-        // and that function then queries us.
-        let hb_message = MessageBuilder::new()
-          .ts_msg(endianness, Some(Timestamp::now()))
-          .heartbeat_msg(
-            writer_guid.entity_id, // from Writer
-            first_change,
-            last_change,
-            heartbeat_count,
-            endianness,
-            EntityId::UNKNOWN, // to Reader
-            final_flag,
-            liveliness_flag,
-          )
-          .add_header_and_build(writer_guid.prefix);
-
-          crate::io_uring::rtps::Writer::send_message_to_readers(
-            Endianness::LittleEndian,
-            DeliveryMode::Multicast,
-            hb_message,
-            reader_proxies.values(),
-            udp_sender,
-            ring,
-          );
-        
-    }
-}
-
-use crate::messages::submessages::submessages::ACKNACK_Flags;
 use enumflags2::BitFlags;
-use crate::messages::submessages::submessages::AckNack;
-use crate::messages::submessages::submessages::InfoDestination;
-use crate::rtps::Message;
 
-use crate::messages::submessages::submessages::Heartbeat;
+use crate::{
+  messages::submessages::submessages::{ACKNACK_Flags, AckNack, Heartbeat, InfoDestination},
+  rtps::Message,
+};
 
 pub(crate) struct BuiltinParticipantLost {
   readers: vec::IntoIter<GUID>,
@@ -1584,9 +1535,7 @@ impl<D: Keyed> Iterator for BuiltinParticipantLostInner<'_, '_, D> {
   }
 }
 
-use crate::io_uring::rtps::DataStatus;
-
-use crate::Keyed;
+use crate::{io_uring::rtps::DataStatus, Keyed};
 
 pub(crate) struct Caches<S> {
   pub(crate) publications: Cache<DiscoveredWriterData, S>,
@@ -1647,6 +1596,7 @@ impl Caches<timer_state::Uninit> {
     self,
     ring: &mut IoUring,
     domain_id: u16,
+    user: u8,
   ) -> std::io::Result<Caches<timer_state::Init>> {
     let Caches {
       publications,
@@ -1656,11 +1606,11 @@ impl Caches<timer_state::Uninit> {
       participant_messages,
     } = self;
 
-    let publications = publications.register(ring, domain_id)?;
-    let topics = topics.register(ring, domain_id)?;
-    let participants = participants.register(ring, domain_id)?;
-    let subscriptions = subscriptions.register(ring, domain_id)?;
-    let participant_messages = participant_messages.register(ring, domain_id)?;
+    let publications = publications.register(ring, domain_id, user)?;
+    let topics = topics.register(ring, domain_id, user)?;
+    let participants = participants.register(ring, domain_id, user)?;
+    let subscriptions = subscriptions.register(ring, domain_id, user)?;
+    let participant_messages = participant_messages.register(ring, domain_id, user)?;
     Ok(Caches {
       publications,
       topics,
@@ -1743,13 +1693,35 @@ impl<S> Caches<S> {
 }
 
 impl Caches<timer_state::Init> {
-  fn topic_cache_from_entity_id(&mut self, entity_id: EntityId) -> &mut TopicCache {
+  fn topic_cache_from_entity_id(
+    &mut self,
+    entity_id: EntityId,
+    remote_writer: &GUID,
+  ) -> (&mut TopicCache, Option<&mut RtpsWriterProxy>) {
     match entity_id {
-      EntityId::SEDP_BUILTIN_PUBLICATIONS_WRITER => &mut self.publications.topic,
-      EntityId::SEDP_BUILTIN_TOPIC_WRITER => &mut self.topics.topic,
-      EntityId::SPDP_BUILTIN_PARTICIPANT_WRITER => &mut self.participants.topic,
-      EntityId::SEDP_BUILTIN_SUBSCRIPTIONS_WRITER => &mut self.subscriptions.topic,
-      EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_WRITER => &mut self.participant_messages.topic,
+      EntityId::SEDP_BUILTIN_PUBLICATIONS_WRITER => (
+        &mut self.publications.topic,
+        self.publications.writer_proxies.get_mut(remote_writer),
+      ),
+      EntityId::SEDP_BUILTIN_TOPIC_WRITER => (
+        &mut self.topics.topic,
+        self.topics.writer_proxies.get_mut(remote_writer),
+      ),
+      EntityId::SPDP_BUILTIN_PARTICIPANT_WRITER => (
+        &mut self.participants.topic,
+        self.participants.writer_proxies.get_mut(remote_writer),
+      ),
+      EntityId::SEDP_BUILTIN_SUBSCRIPTIONS_WRITER => (
+        &mut self.subscriptions.topic,
+        self.subscriptions.writer_proxies.get_mut(remote_writer),
+      ),
+      EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_WRITER => (
+        &mut self.participant_messages.topic,
+        self
+          .participant_messages
+          .writer_proxies
+          .get_mut(remote_writer),
+      ),
       _ => unreachable!(),
     }
   }
@@ -1847,8 +1819,7 @@ impl Caches<timer_state::Init> {
       topic_cache.get_changes_in_range_best_effort(latest_instant, Timestamp::now())
     };
 
-    use crate::serialization::pl_cdr_adapters::PlCdrDeserializerAdapter;
-    use crate::CDRDeserializerAdapter;
+    use crate::{serialization::pl_cdr_adapters::PlCdrDeserializerAdapter, CDRDeserializerAdapter};
 
     let mut reliable_reading = None;
 
@@ -1986,6 +1957,8 @@ impl Caches<timer_state::Init> {
     udp_sender: &UDPSender,
     ring: &mut IoUring,
   ) -> bool {
+    //panic!("{writer_guid:?}");
+
     match writer_guid.entity_id {
       EntityId::SEDP_BUILTIN_PUBLICATIONS_WRITER => self.publications.handle_heartbeat_msg(
         writer_guid,
@@ -2106,6 +2079,17 @@ impl Caches<timer_state::Init> {
       },
       _ => unreachable!("all builtin timers should be checked by now."),
     })
+  }
+
+  fn initialize(&mut self, udp_sender: &UDPSender, ring: &mut io_uring::IoUring) {
+    let Self {
+      topics,
+      participant_messages,
+      ..
+    } = self;
+
+    topics.handle_heartbeat_tick(false, udp_sender, ring);
+    participant_messages.handle_heartbeat_tick(false, udp_sender, ring);
   }
 }
 
@@ -2496,8 +2480,9 @@ impl Iterator for DiscoveredData<'_, '_, DiscoveredWriterData> {
 }
 
 //wrapper for DiscoveredData<'a, DiscoveredTopicData>
-//to be able to iterate over the updated readers/writers associated with the topic.
-//if there are no readers/writers for a topic then a status event will not be emitted.
+//to be able to iterate over the updated readers/writers associated with the
+// topic. if there are no readers/writers for a topic then a status event will
+// not be emitted.
 use std::vec;
 
 #[derive(Debug)]
@@ -2639,9 +2624,10 @@ impl Iterator for DiscoveredData<'_, '_, DiscoveredTopicData> {
   }
 }
 
-// DomainParticipantStatusEvent is for the user to listen in on the domain participant (wow)
-// DiscoveryNotificationType is used in the DpEventLoop (now Domain) to update connections (and
-// also send some DomainParticipantStatusEvent's)
+// DomainParticipantStatusEvent is for the user to listen in on the domain
+// participant (wow) DiscoveryNotificationType is used in the DpEventLoop (now
+// Domain) to update connections (and also send some
+// DomainParticipantStatusEvent's)
 
 impl Timers<timer_state::Uninit> {
   const PARTICIPANT_CLEANUP_PERIOD: StdDuration = StdDuration::from_secs(2);
@@ -2670,6 +2656,7 @@ impl Timers<timer_state::Uninit> {
     self,
     ring: &mut io_uring::IoUring,
     domain_id: u16,
+    user: u8,
   ) -> std::io::Result<Timers<timer_state::Init>> {
     let Self {
       participant_cleanup,
@@ -2678,27 +2665,31 @@ impl Timers<timer_state::Uninit> {
       participant_messages,
     } = self;
 
-    use crate::io_uring::encoding::user_data::{Timer, BuiltinTimerVariant};
+    use crate::io_uring::encoding::user_data::{BuiltinTimerVariant, Timer};
 
     let participant_cleanup = participant_cleanup.register(
       ring,
       domain_id,
       Timer::Builtin(BuiltinTimerVariant::ParticipantCleaning),
+      user,
     )?;
     let topic_cleanup = topic_cleanup.register(
       ring,
       domain_id,
       Timer::Builtin(BuiltinTimerVariant::TopicCleaning),
+      user,
     )?;
     let spdp_publish = spdp_publish.register(
       ring,
       domain_id,
       Timer::Builtin(BuiltinTimerVariant::SpdpPublish),
+      user,
     )?;
     let participant_messages = participant_messages.register(
       ring,
       domain_id,
       Timer::Builtin(BuiltinTimerVariant::ParticipantMessages),
+      user,
     )?;
 
     Ok(Timers {
@@ -2736,6 +2727,7 @@ pub struct Discovery2<T> {
 
   timers: Timers<T>,
   pub(crate) caches: Caches<T>,
+  initialized: bool,
 }
 
 impl Discovery2<timer_state::Uninit> {
@@ -2753,12 +2745,14 @@ impl Discovery2<timer_state::Uninit> {
       security_opt,
       caches: Caches::new(guid_prefix),
       domain_id,
+      initialized: false,
     }
   }
 
   pub fn register(
     self,
     ring: &mut io_uring::IoUring,
+    user: u8,
   ) -> std::io::Result<Discovery2<timer_state::Init>> {
     let Self {
       timers,
@@ -2766,10 +2760,11 @@ impl Discovery2<timer_state::Uninit> {
       security_opt,
       caches,
       domain_id,
+      initialized,
     } = self;
 
-    let timers = timers.register(ring, domain_id)?;
-    let caches = caches.register(ring, domain_id)?;
+    let timers = timers.register(ring, domain_id, user)?;
+    let caches = caches.register(ring, domain_id, user)?;
 
     Ok(Discovery2 {
       timers,
@@ -2777,6 +2772,7 @@ impl Discovery2<timer_state::Uninit> {
       security_opt,
       caches,
       domain_id,
+      initialized,
     })
   }
 }
@@ -2793,6 +2789,8 @@ impl Discovery2<timer_state::Init> {
     use crate::messages::submessages::submessage::HasEntityIds;
 
     let sender_id = submsg.sender_entity_id();
+
+    //println!("({:?} / {sender_id:?})", submsg.receiver_entity_id());
 
     if !matches!(
       (submsg.receiver_entity_id(), sender_id),
@@ -2819,12 +2817,15 @@ impl Discovery2<timer_state::Init> {
 
     match submsg {
       WriterSubmessage::Data(data, flags) => {
-        use crate::messages::submessages::elements::inline_qos::InlineQos;
-        use crate::messages::submessages::submessages::DATA_Flags;
-        use crate::WriteOptionsBuilder;
-        use crate::dds::ddsdata::DDSData;
-        use crate::structure::cache_change::ChangeKind;
-        use crate::messages::submessages::elements::serialized_payload::SerializedPayload;
+        use crate::{
+          dds::ddsdata::DDSData,
+          messages::submessages::{
+            elements::{inline_qos::InlineQos, serialized_payload::SerializedPayload},
+            submessages::DATA_Flags,
+          },
+          structure::cache_change::ChangeKind,
+          WriteOptionsBuilder,
+        };
 
         let receive_timestamp = Timestamp::now();
 
@@ -2968,11 +2969,15 @@ impl Discovery2<timer_state::Init> {
           return Ok(None);
         };
 
+        //println!("trying to add cache change");
+
         use crate::structure::cache_change::CacheChange;
         let cache_change =
           CacheChange::new(writer_guid, writer_seq_num, write_options_b.build(), data);
 
-        let topic_cache = self.caches.topic_cache_from_entity_id(sender_id);
+        let (topic_cache, writer) = self
+          .caches
+          .topic_cache_from_entity_id(sender_id, &writer_guid);
         topic_cache.add_change(&receive_timestamp, cache_change);
 
         use crate::io_uring::discovery::discovery::Reliability;
@@ -2982,11 +2987,21 @@ impl Discovery2<timer_state::Init> {
           Some(Reliability::Reliable { .. })
         );
 
-        //1) populate changes to datasample_cache
+        if let Some(writer) = writer {
+          if !writer.should_ignore_change(writer_seq_num) {
+            writer.received_changes_add(writer_seq_num, receive_timestamp);
+          } else {
+            println!("ignoring cache change")
+          }
+
+          topic_cache.mark_reliably_received_before(writer_guid, writer.all_ackable_before());
+        }
+
+        // 1) populate changes to datasample_cache
         //TODO: replace 'false' with 'is_reliable'
         // - this currently makes msg delivery unreliable
         self.caches.populate_changes(sender_id, false);
-        //2) handle unread changes from the datasample_cache and bring them back here.
+        // 2) handle unread changes from the datasample_cache and bring them back here.
 
         if matches!(sender_id, EntityId::SPDP_BUILTIN_PARTICIPANT_WRITER) {
           //TODO: send spdp_liveness for the given guid prefix
@@ -3043,7 +3058,7 @@ impl Discovery2<timer_state::Init> {
     self
       .caches
       .participants
-      .write::<PlCdrSerializerAdapter<SpdpDiscoveredParticipantData>>(data, udp_sender, ring)
+      .write::<PlCdrSerializerAdapter<SpdpDiscoveredParticipantData>>(data, udp_sender, ring, true)
       .unwrap();
   }
 
@@ -3052,6 +3067,7 @@ impl Discovery2<timer_state::Init> {
     submsg: ReaderSubmessage,
     source_guid_prefix: GuidPrefix,
     ring: &mut IoUring,
+    user: u8,
   ) -> Result<Option<()>, (ReaderSubmessage, GuidPrefix)> {
     use crate::messages::submessages::submessage::HasEntityIds;
     let sender_id = submsg.sender_entity_id();
@@ -3086,34 +3102,37 @@ impl Discovery2<timer_state::Init> {
     let domain_id = self.domain_id;
 
     match sender_id {
-      EntityId::SEDP_BUILTIN_PUBLICATIONS_READER => {
-        self
-          .caches
-          .publications
-          .handle_acknack(ack_submsg, source_guid_prefix, ring, domain_id)
-      }
+      EntityId::SEDP_BUILTIN_PUBLICATIONS_READER => self.caches.publications.handle_acknack(
+        ack_submsg,
+        source_guid_prefix,
+        ring,
+        domain_id,
+        user,
+      ),
       EntityId::SEDP_BUILTIN_TOPIC_READER => {
         self
           .caches
           .topics
-          .handle_acknack(ack_submsg, source_guid_prefix, ring, domain_id)
+          .handle_acknack(ack_submsg, source_guid_prefix, ring, domain_id, user)
       }
-      EntityId::SEDP_BUILTIN_SUBSCRIPTIONS_READER => {
-        self
-          .caches
-          .subscriptions
-          .handle_acknack(ack_submsg, source_guid_prefix, ring, domain_id)
-      }
-      EntityId::SPDP_BUILTIN_PARTICIPANT_READER => {
-        self
-          .caches
-          .participants
-          .handle_acknack(ack_submsg, source_guid_prefix, ring, domain_id)
-      }
+      EntityId::SEDP_BUILTIN_SUBSCRIPTIONS_READER => self.caches.subscriptions.handle_acknack(
+        ack_submsg,
+        source_guid_prefix,
+        ring,
+        domain_id,
+        user,
+      ),
+      EntityId::SPDP_BUILTIN_PARTICIPANT_READER => self.caches.participants.handle_acknack(
+        ack_submsg,
+        source_guid_prefix,
+        ring,
+        domain_id,
+        user,
+      ),
       EntityId::P2P_BUILTIN_PARTICIPANT_MESSAGE_READER => self
         .caches
         .participant_messages
-        .handle_acknack(ack_submsg, source_guid_prefix, ring, domain_id),
+        .handle_acknack(ack_submsg, source_guid_prefix, ring, domain_id, user),
       _ => unreachable!(),
     }
     Ok(Some(()))
@@ -3160,7 +3179,7 @@ impl Discovery2<timer_state::Init> {
         timenow.duration_since(self.liveliness_state.last_auto_update);
       trace!(
         "time_since_last_auto_update: {time_since_last_auto_update:?}, min_auto_duration \
-             {min_auto_duration:?}"
+         {min_auto_duration:?}"
       );
 
       // We choose to send a new liveliness message if longer than half of the min
@@ -3198,7 +3217,7 @@ impl Discovery2<timer_state::Init> {
       self
         .caches
         .participant_messages
-        .write::<CDRSerializerAdapter<ParticipantMessageData>>(msg, udp_sender, ring)
+        .write::<CDRSerializerAdapter<ParticipantMessageData>>(msg, udp_sender, ring, true)
         .unwrap();
     }
   }
@@ -3223,6 +3242,8 @@ impl Discovery2<timer_state::Init> {
       return;
     };
 
+    //println!("publishing writer: {writer:?}");
+
     if !writer
       .writer_proxy
       .remote_writer_guid
@@ -3237,7 +3258,12 @@ impl Discovery2<timer_state::Init> {
     self
       .caches
       .publications
-      .write::<PlCdrSerializerAdapter<DiscoveredWriterData>>(writer.clone(), udp_sender, ring)
+      .write::<PlCdrSerializerAdapter<DiscoveredWriterData>>(
+        writer.clone(),
+        udp_sender,
+        ring,
+        self.initialized,
+      )
       .unwrap();
   }
 
@@ -3253,6 +3279,8 @@ impl Discovery2<timer_state::Init> {
       return;
     };
 
+    //println!("publish reader: {reader:?}");
+
     if !reader
       .reader_proxy
       .remote_reader_guid
@@ -3267,7 +3295,12 @@ impl Discovery2<timer_state::Init> {
     self
       .caches
       .subscriptions
-      .write::<PlCdrSerializerAdapter<DiscoveredReaderData>>(reader.clone(), udp_sender, ring)
+      .write::<PlCdrSerializerAdapter<DiscoveredReaderData>>(
+        reader.clone(),
+        udp_sender,
+        ring,
+        self.initialized,
+      )
       .unwrap();
   }
 
@@ -3278,13 +3311,30 @@ impl Discovery2<timer_state::Init> {
     ring: &mut IoUring,
     domain: &Domain<timer_state::Init, buf_ring_state::Init>,
   ) {
+    //println!("init participant");
     self.initialize_participant(
       discovery_db,
       domain.domain_info.domain_participant_guid,
       &domain.listeners,
     );
+
+    self.initialized = true;
+
+    //println!("publishing ext");
+
+    self.spdp_publish(
+      domain.domain_info.domain_participant_guid,
+      &domain.listeners,
+      udp_sender,
+      ring,
+    );
+
+    self.publish_participant_message(discovery_db, udp_sender, ring);
+
     self.publish_writers(discovery_db, udp_sender, ring);
-    self.publish_readers(discovery_db, udp_sender, ring)
+    self.publish_readers(discovery_db, udp_sender, ring);
+
+    self.caches.initialize(udp_sender, ring);
   }
 
   fn initialize_participant(
@@ -3309,8 +3359,17 @@ impl Discovery2<timer_state::Init> {
       &self.security_opt,
       Duration::INFINITE,
     );
-
     discovery_db.update_participant(&participant_data);
+
+    // dont care to send updates for discovering itself
+    for _ in crate::io_uring::rtps::dp_event_loop::UpdatedParticipant2::new(
+      &mut self.caches,
+      participant_data,
+    ) {}
+  }
+
+  pub fn initialized(&self) -> bool {
+    self.initialized
   }
 
   fn publish_writers(
@@ -3378,6 +3437,7 @@ impl Discovery2<timer_state::Init> {
         &Endpoint_GUID(guid),
         udp_sender,
         ring,
+        true,
       )
       .unwrap();
   }
@@ -3399,6 +3459,7 @@ impl Discovery2<timer_state::Init> {
         &Endpoint_GUID(guid),
         udp_sender,
         ring,
+        true,
       )
       .unwrap();
   }
@@ -3424,13 +3485,17 @@ impl Discovery2<timer_state::Init> {
     self
       .caches
       .topics
-      .write::<PlCdrSerializerAdapter<DiscoveredTopicData>>(topic_data.clone(), udp_sender, ring)
+      .write::<PlCdrSerializerAdapter<DiscoveredTopicData>>(
+        topic_data.clone(),
+        udp_sender,
+        ring,
+        self.initialized,
+      )
       .unwrap();
   }
 }
 
-use crate::messages::submessages::submessages::ReaderSubmessage;
-use crate::messages::submessages::submessages::AckSubmessage;
+use crate::messages::submessages::submessages::{AckSubmessage, ReaderSubmessage};
 
 // -----------------------------------------------------------------------
 // -----------------------------------------------------------------------

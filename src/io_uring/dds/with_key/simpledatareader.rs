@@ -11,8 +11,12 @@ use crate::{
     key::*,
     qos::*,
     result::*,
-    with_key::datasample::{DeserializedCacheChange, Sample},
+    with_key::{
+      datasample::{DeserializedCacheChange, Sample},
+      simpledatareader::ReadState,
+    },
   },
+  io_uring::dds::topic::{Topic, TopicDescription},
   serialization::CDRDeserializerAdapter,
   structure::{
     cache_change::CacheChange,
@@ -23,10 +27,6 @@ use crate::{
     time::Timestamp,
   },
 };
-
-use crate::io_uring::dds::topic::{Topic, TopicDescription};
-
-use crate::dds::with_key::simpledatareader::ReadState;
 
 /// SimpleDataReaders can only do "take" semantics and does not have
 /// any deduplication or other DataSampleCache functionality.

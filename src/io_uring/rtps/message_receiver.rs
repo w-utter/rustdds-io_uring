@@ -5,8 +5,12 @@ use log::{debug, error, info, trace, warn};
 use bytes::Bytes;
 
 use crate::{
+  io_uring::{rtps::reader::Reader, timer::timer_state},
   messages::{protocol_version::ProtocolVersion, submessages::submessages::*, vendor_id::VendorId},
-  rtps::{Message, Submessage, SubmessageBody},
+  rtps::{
+    message_receiver::{MessageReceiverState, SecureReceiverState},
+    Message, Submessage, SubmessageBody,
+  },
   structure::{
     entity::RTPSEntity,
     guid::{EntityId, GuidPrefix, GUID},
@@ -14,15 +18,8 @@ use crate::{
     time::Timestamp,
   },
 };
-
-use crate::io_uring::rtps::reader::Reader;
-use crate::io_uring::timer::timer_state;
-
-use crate::rtps::message_receiver::{SecureReceiverState, MessageReceiverState};
-
 #[cfg(feature = "security")]
 use crate::rtps::message_receiver::SecureWrapping;
-
 #[cfg(feature = "security")]
 use crate::security::{
   cryptographic::{DecodeOutcome, DecodedSubmessage},
@@ -64,7 +61,7 @@ impl<'a> Iterator for SubmessageIter2<'a> {
 
     if matches!(
       &sub_msg.body,
-      /*SubmessageBody::Writer(_) |*/ SubmessageBody::Reader(_)
+      /* SubmessageBody::Writer(_) | */ SubmessageBody::Reader(_)
     ) {
       //println!("\n{sub_msg:?}\n");
     }
@@ -733,14 +730,12 @@ mod tests {
       typedesc::TypeDesc,
       with_key::simpledatareader::ReaderCommand,
     },
+    io_uring::{network::udp_sender::UDPSender, rtps::reader::ReaderIngredients},
     messages::header::Header,
     mio_source,
     serialization::from_bytes,
     structure::{dds_cache::DDSCache, guid::EntityKind},
   };
-
-  use crate::io_uring::rtps::reader::ReaderIngredients;
-  use crate::io_uring::network::udp_sender::UDPSender;
   use super::*;
 
   #[test]
@@ -922,22 +917,5 @@ mod tests {
     let bytes = header.write_to_vec().unwrap();
     let new_header = Header::read_from_buffer(&bytes).unwrap();
     assert_eq!(header, new_header);
-  }
-}
-
-struct TargetReaderEntityIdIter {
-  iter: std::vec::IntoIter<EntityId>,
-}
-
-impl From<std::vec::IntoIter<EntityId>> for TargetReaderEntityIdIter {
-  fn from(iter: std::vec::IntoIter<EntityId>) -> TargetReaderEntityIdIter {
-    Self { iter }
-  }
-}
-
-impl Iterator for TargetReaderEntityIdIter {
-  type Item = EntityId;
-  fn next(&mut self) -> Option<Self::Item> {
-    self.iter.next()
   }
 }

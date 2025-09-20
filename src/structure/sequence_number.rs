@@ -95,6 +95,18 @@ impl From<SequenceNumber> for i64 {
   }
 }
 
+impl nodit::DiscreteFinite for SequenceNumber {
+  const MIN: Self = Self(i64::MIN);
+  const MAX: Self = Self(i64::MAX);
+
+  fn up(self) -> Option<Self> {
+    Some(self.plus_1())
+  }
+  fn down(self) -> Option<Self> {
+    Some(Self(self.0 - 1))
+  }
+}
+
 // ---------------------------------------
 
 #[derive(Clone, Copy, Debug)]
@@ -342,6 +354,10 @@ where
 
   pub fn base(&self) -> N {
     self.bitmap_base
+  }
+
+  pub fn limit(&self) -> N {
+    self.iter().next_back().unwrap_or(self.base())
   }
 
   pub fn new_empty(bitmap_base: N) -> Self {

@@ -1,5 +1,4 @@
-use std::net::UdpSocket;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 
 use crate::structure::locator::Locator;
 
@@ -23,7 +22,7 @@ impl UDPSender {
     let mut multicast_sockets = Vec::with_capacity(1);
 
     for multicast_if_ipaddr in crate::network::util::get_local_multicast_ip_addrs()? {
-      use socket2::{Socket, Domain, Type, Protocol, SockAddr};
+      use socket2::{Domain, Protocol, SockAddr, Socket, Type};
       let mc_socket = match multicast_if_ipaddr {
         IpAddr::V4(v4) => {
           let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -72,22 +71,23 @@ impl UDPSender {
   ) -> std::io::Result<()> {
     use socket2::SockAddr;
     let raw_addr: SockAddr = addr.into();
-    let addr_ptr = raw_addr.as_ptr();
-    let addr_len = raw_addr.len();
+
+    use std::os::fd::AsRawFd;
 
     use io_uring::{opcode, types::Fd};
-    use std::os::fd::AsRawFd;
     for mc_sock in &self.multicast_sockets {
       let send = opcode::Send::new(Fd(mc_sock.as_raw_fd()), buf.as_ptr(), buf.len() as _)
-        .dest_addr(addr_ptr)
-        .dest_addr_len(addr_len)
-        .build();
+        .dest_addr(raw_addr.as_ptr())
+        .dest_addr_len(raw_addr.len())
+        .build()
+        .user_data(123)
+        .flags(io_uring::squeue::Flags::SKIP_SUCCESS);
 
       unsafe {
         ring.submission().push(&send).unwrap();
       }
+      ring.submitter().submit()?;
     }
-    ring.submitter().submit()?;
     Ok(())
   }
 
@@ -104,13 +104,16 @@ impl UDPSender {
 
     let uni_sock = &self.unicast_socket;
 
-    use io_uring::{opcode, types::Fd};
     use std::os::fd::AsRawFd;
+
+    use io_uring::{opcode, types::Fd};
 
     let send = opcode::Send::new(Fd(uni_sock.as_raw_fd()), buf.as_ptr(), buf.len() as _)
       .dest_addr(addr_ptr)
       .dest_addr_len(addr_len)
-      .build();
+      .build()
+      .user_data(124)
+      .flags(io_uring::squeue::Flags::SKIP_SUCCESS);
 
     unsafe {
       ring.submission().push(&send).unwrap();

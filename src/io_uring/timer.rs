@@ -1,41 +1,43 @@
-use timerfd::{TimerFd, TimerState, SetTimeFlags};
+// TODO: this needs to be moved to multishot timeouts
+//  - similar to what was used for ecat
+
 pub struct Timer<T, S> {
   state: S,
   t: T,
 }
 
 pub mod timer_state {
-  use timerfd::{TimerFd, TimerState, SetTimeFlags};
   pub struct Uninit {
-    pub(crate) state: TimerState,
-    pub(crate) flags: Option<SetTimeFlags>,
+    pub(crate) duration: core::time::Duration,
+    pub(crate) multishot: bool,
   }
 
-  pub struct Init {
-    pub(crate) tfd: TimerFd,
-    pub(super) prev_state: TimerState,
-  }
+  pub struct Init;
 }
 
-use timer_state::*;
 use core::time::Duration;
 
-use crate::io_uring::encoding;
+use timer_state::*;
 use encoding::user_data;
 
+use crate::io_uring::encoding;
+
 impl<T> Timer<T, Uninit> {
-  pub(crate) fn new(t: T, state: TimerState) -> Self {
-    let state = Uninit { state, flags: None };
+  pub(crate) fn new(t: T, duration: Duration) -> Self {
+    Self::new_(t, duration, false)
+  }
+
+  pub(crate) fn new_(t: T, duration: Duration, multishot: bool) -> Self {
+    let state = Uninit {
+      duration,
+      multishot,
+    };
 
     Self { state, t }
   }
 
   pub(crate) fn new_periodic(t: T, duration: Duration) -> Self {
-    let state = TimerState::Periodic {
-      current: duration,
-      interval: duration,
-    };
-    Self::new(t, state)
+    Self::new_(t, duration, true)
   }
 
   pub(crate) fn register(
@@ -43,12 +45,34 @@ impl<T> Timer<T, Uninit> {
     ring: &mut io_uring::IoUring,
     domain_id: u16,
     kind: user_data::Timer,
+    user: u8,
   ) -> std::io::Result<Timer<T, Init>> {
     let Self {
-      state: Uninit { state, flags },
+      state: Uninit {
+        duration,
+        multishot,
+      },
       t,
     } = self;
 
+    let timespec = io_uring::types::Timespec::new()
+      .sec(duration.as_secs())
+      .nsec(duration.subsec_nanos());
+
+    let timeout = io_uring::opcode::Timeout::new(&timespec);
+
+    use io_uring::types::TimeoutFlags;
+    let timeout = if multishot {
+      timeout.flags(TimeoutFlags::MULTISHOT)
+    } else {
+      timeout
+    };
+
+    let timeout = timeout
+      .build()
+      .user_data(encoding::UserData::new(domain_id, user_data::Variant::Timer(kind), user).into());
+
+    /*
     let flags = flags.unwrap_or(SetTimeFlags::Default);
 
     let mut tfd = TimerFd::new()?;
@@ -62,80 +86,39 @@ impl<T> Timer<T, Uninit> {
       .multi(matches!(state, TimerState::Periodic { .. }))
       .build()
       .user_data(encoding::UserData::new(domain_id, user_data::Variant::Timer(kind)).into());
+      */
 
     unsafe {
       ring
         .submission()
-        .push(&poll)
+        .push(&timeout)
         .expect("could not push sqe entry");
     }
 
     ring.submit()?;
 
-    Ok(Timer {
-      state: Init {
-        tfd,
-        prev_state: state,
-      },
-      t,
-    })
+    Ok(Timer { state: Init, t })
   }
 }
 
 impl<T> Timer<T, Init> {
   pub(crate) fn reset(&mut self) {
-    self.state.prev_state = self.state.tfd.get_state();
+    //self.state.prev_state = self.state.tfd.get_state();
   }
 
   pub(crate) fn take_inner(self) -> T {
     self.t
   }
 
-  pub(crate) fn try_update_duration(&mut self, duration: Duration, flags: Option<SetTimeFlags>) {
-    match self.state.prev_state {
-      TimerState::Periodic { interval, .. } if duration != interval => {
-        let flags = flags.unwrap_or(SetTimeFlags::Default);
-        self.state.prev_state = self.state.tfd.set_state(
-          TimerState::Periodic {
-            interval: duration,
-            current: duration,
-          },
-          flags,
-        );
-      }
-      _ => (),
-    }
-  }
-
-  pub(crate) fn new_immediate(
-    t: T,
-    state: TimerState,
-    flags: Option<SetTimeFlags>,
-    ring: &mut io_uring::IoUring,
-    domain_id: u16,
-    kind: user_data::Timer,
-  ) -> std::io::Result<Self> {
-    let mut timer = Timer::new(t, state);
-    timer.state.flags = flags;
-
-    timer.register(ring, domain_id, kind)
-  }
-
   pub(crate) fn new_immediate_oneshot(
     t: T,
     duration: Duration,
-    flags: Option<SetTimeFlags>,
     ring: &mut io_uring::IoUring,
     domain_id: u16,
     kind: user_data::Timer,
+    user: u8,
   ) -> std::io::Result<Self> {
-    Self::new_immediate(
-      t,
-      TimerState::Oneshot(duration),
-      flags,
-      ring,
-      domain_id,
-      kind,
-    )
+    let timer = Timer::new(t, duration);
+    timer.register(ring, domain_id, kind, user)
   }
 }
