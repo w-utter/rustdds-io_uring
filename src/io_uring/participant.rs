@@ -202,7 +202,7 @@ impl Publisher<'_, '_> {
     datawriter
   }
 
-  pub fn create_datawriter_no_key<D: Keyed, SA: SerializerAdapter<D>>(
+  pub fn create_datawriter_no_key<D, SA: crate::dds::adapters::no_key::SerializerAdapter<D>>(
     &mut self,
     qos: Option<QosPolicies>,
     discovery_db: &mut DiscoveryDB,
@@ -217,7 +217,7 @@ impl Publisher<'_, '_> {
     no_key::DataWriter::from_keyed(writer)
   }
 
-  pub fn create_datawriter_no_key_cdr<D: Keyed + serde::Serialize>(
+  pub fn create_datawriter_no_key_cdr<D: serde::Serialize>(
     &mut self,
     qos: Option<QosPolicies>,
     discovery_db: &mut DiscoveryDB,
@@ -226,10 +226,7 @@ impl Publisher<'_, '_> {
     discovery: &mut Discovery2<timer_state::Init>,
     udp_sender: &UDPSender,
     user: u8,
-  ) -> no_key::DataWriterCdr<D>
-  where
-    <D as Keyed>::K: serde::Serialize,
-  {
+  ) -> no_key::DataWriterCdr<D> {
     self.create_datawriter_no_key(qos, discovery_db, domain, ring, discovery, udp_sender, user)
   }
 }
@@ -381,7 +378,7 @@ impl Subscriber<'_, '_> {
     SimpleDataReader::new(guid.prefix, guid.entity_id, self.topic.clone(), reader_qos)
   }
 
-  pub fn create_datareader_no_key<D: Keyed + 'static, SA: DeserializerAdapter<D>>(
+  pub fn create_datareader_no_key<D: 'static, SA: crate::dds::adapters::no_key::DeserializerAdapter<D>>(
     &mut self,
     qos: Option<QosPolicies>,
     dds_cache: &mut DDSCache,
@@ -406,7 +403,7 @@ impl Subscriber<'_, '_> {
     Ok(no_key::DataReader::from_keyed(reader))
   }
 
-  pub fn create_datareader_no_key_cdr<D: Keyed + serde::de::DeserializeOwned + 'static>(
+  pub fn create_datareader_no_key_cdr<D: serde::de::DeserializeOwned + 'static>(
     &mut self,
     qos: Option<QosPolicies>,
     dds_cache: &mut DDSCache,
@@ -416,10 +413,7 @@ impl Subscriber<'_, '_> {
     discovery: &mut Discovery2<timer_state::Init>,
     udp_sender: &UDPSender,
     user: u8,
-  ) -> CreateResult<no_key::DataReaderCdr<D>>
-  where
-    <D as Keyed>::K: serde::de::DeserializeOwned,
-  {
+  ) -> CreateResult<no_key::DataReaderCdr<D>> {
     self.create_datareader_no_key(
       qos,
       dds_cache,
