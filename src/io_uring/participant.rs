@@ -79,6 +79,10 @@ impl TopicComponent<'_> {
       qos,
     }
   }
+
+  pub fn topic(&self) -> &Topic {
+      &self.topic
+  }
 }
 
 pub struct Publisher<'a, 'q> {
