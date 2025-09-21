@@ -61,6 +61,22 @@ impl Participant {
     self.entity_id_gen += 1;
     EntityId::new([papa_byte, mama_byte, baby_byte], entity_kind)
   }
+
+  pub fn publisher<'a, 'q>(&'a mut self, topic: &'a Topic, qos: &'q QosPolicies) -> Publisher<'a, 'q> {
+      Publisher {
+          topic,
+          participant: self,
+          qos,
+      }
+  }
+
+  pub fn subscriber<'a, 'q>(&'a mut self, topic: &'a Topic, qos: &'q QosPolicies) -> Subscriber<'a, 'q> {
+      Subscriber {
+          topic,
+          participant: self,
+          qos,
+      }
+  }
 }
 
 impl TopicComponent<'_> {
