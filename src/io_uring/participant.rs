@@ -83,6 +83,10 @@ impl TopicComponent<'_> {
   pub fn topic(&self) -> &Topic {
       &self.topic
   }
+
+  pub fn inner(self) -> Topic {
+      self.topic
+  }
 }
 
 pub struct Publisher<'a, 'q> {
