@@ -200,7 +200,7 @@ impl Subscriber<'_, '_> {
     Ok(with_key::DataReader::from_simple_data_reader(simple))
   }
 
-  fn create_simple_datareader<D: Keyed + 'static, SA: DeserializerAdapter<D>>(
+  pub fn create_simple_datareader<D: Keyed + 'static, SA: DeserializerAdapter<D>>(
     &mut self,
     qos: Option<QosPolicies>,
     dds_cache: &mut DDSCache,
@@ -211,11 +211,6 @@ impl Subscriber<'_, '_> {
     udp_sender: &UDPSender,
     user: u8,
   ) -> CreateResult<SimpleDataReader<D, SA>> {
-    // pubsub line 786
-    // pubsub line 1216
-    // pubsub line 986
-    // pubsub line 1010
-
     use crate::dds::qos::HasQoSPolicy;
     let reader_qos = self
       .qos
@@ -287,6 +282,23 @@ impl Subscriber<'_, '_> {
 
     SimpleDataReader::new(guid.prefix, guid.entity_id, self.topic.clone(), reader_qos)
   }
+
+  pub fn create_simple_datareader_no_key<D: 'static, SA: crate::no_key::DeserializerAdapter<D> + 'static>(
+    &mut self,
+    qos: Option<QosPolicies>,
+    dds_cache: &mut DDSCache,
+    discovery_db: &mut DiscoveryDB,
+    domain: &mut Domain<timer_state::Init, buf_ring_state::Init>,
+    ring: &mut IoUring,
+    discovery: &mut Discovery2<timer_state::Init>,
+    udp_sender: &UDPSender,
+    user: u8,
+  ) -> CreateResult<no_key::SimpleDataReader<D, SA>> {
+      use crate::no_key::wrappers::{DAWrapper, NoKeyWrapper};
+      let keyed = self.create_simple_datareader::<NoKeyWrapper<D>, DAWrapper<SA>>(qos, dds_cache, discovery_db, domain, ring, discovery, udp_sender, user)?;
+      Ok(no_key::SimpleDataReader::from_keyed(keyed))
+  }
+
 
   pub fn create_datareader_no_key<
     D: 'static,
