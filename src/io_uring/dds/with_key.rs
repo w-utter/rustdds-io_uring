@@ -4,4 +4,4 @@ pub(crate) mod simpledatareader;
 
 pub use datareader::{DataReader, DataReaderCdr};
 pub use simpledatareader::SimpleDataReader;
-pub use datawriter::{DataWriter, DataWriterCdr};
+pub use datawriter::{DataWriter, DataWriterCdr, DataSample};
