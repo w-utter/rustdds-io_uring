@@ -600,10 +600,10 @@ impl Domain<timer_state::Init, buf_ring_state::Init> {
 }
 
 pub struct DomainRef<'a, 'b> {
-  pub(crate) writers: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
-  pub(crate) ring: &'b mut IoUring,
-  pub(crate) discovery: &'b mut Discovery2<timer_state::Init>,
-  pub(crate) udp_sender: &'b UDPSender,
+  pub writers: &'a mut HashMap<EntityId, Writer<timer_state::Init>>,
+  pub ring: &'b mut IoUring,
+  pub discovery: &'b mut Discovery2<timer_state::Init>,
+  pub udp_sender: &'b UDPSender,
 }
 
 impl<'a, 'b> DomainRef<'a, 'b> {
